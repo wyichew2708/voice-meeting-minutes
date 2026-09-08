@@ -10,6 +10,8 @@ meeting ends.
   identification, minutes generation, deployment, risks, delivery plan
 - **[docs/api-contract.md](docs/api-contract.md)** — WebSocket protocol, REST surface,
   database schema, upstream service contracts, configuration
+- **[docs/scale-test.md](docs/scale-test.md)** — the ten-person test run, what it broke, and
+  what changed as a result (`cd sim && python3 test_scale.py` to reproduce)
 
 ## What it does
 
@@ -40,7 +42,33 @@ warm-up can stand aside. Final lines are never governed. See
 
 The audio gates that stop the recogniser inventing sentences over silence, the browser mic
 capture, and the ASR client are all lifted from voicebot rather than rewritten —
-see [the reuse table](docs/solution-design.md#what-is-lifted-from-voicebot-and-how).
+see [the reuse table](docs/solution-design.md#31-what-is-lifted-from-voicebot-and-how).
+
+## Ten people
+
+The brief requires meetings of at least ten. There is no app to load-test yet, so the two
+things that *can* be tested without one were: the clustering algorithm that decides who is
+speaking, and the capacity arithmetic of the shared GPU services. `sim/` does both.
+
+It found two things that would have shipped broken. The clustering threshold in the first
+draft — 0.70, honestly labelled as a convention rather than a measurement — turned out to sit
+outside the working range at **every** meeting size, producing 154 speaker labels for a
+10-person meeting. And embedding on the ASR segment rather than on the speaker's turn collapsed
+completely in an interrupt-heavy meeting: 129 clusters for 10 people. Both are fixed and
+verified; with the fixes the algorithm is exact from 2 to 12 people and holds to 20.
+
+It also found the honest limit. Two people who genuinely sound alike are merged, and ten people
+means 45 speaker pairs against four people's 6 — so the offline refine pass and manual split,
+both deferred out of v1 in the first draft, moved back into P1 and P2.
+
+The good news is most of it: **ASR load does not grow with headcount** (one room mic, one
+person talking at a time), quiet participants are still found, transcript volume is
+comfortable, and an hour of ten people fits the minutes model in a single pass. The one
+capacity limit is live interim text, which fits one concurrent meeting alongside a live
+voicebot call at 55% utilisation — a second meeting gets finals-only.
+
+Full numbers, method and caveats — the embeddings are synthetic, and this tests the algorithm,
+not the models — in [docs/scale-test.md](docs/scale-test.md).
 
 ## Before implementation starts
 

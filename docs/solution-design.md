@@ -43,7 +43,9 @@ One page, three states.
 - **Start / Pause / End.** Pause stops sending audio and freezes the clock; the meeting and
   its speaker roster survive. End closes the recording and kicks off minutes generation.
 - **Live transcript**, Zoom/Teams style: the in-progress line is grey and italic and rewrites
-  itself as more audio arrives; when the speaker stops it settles into a solid final line.
+  itself as more audio arrives; when the speaker stops it settles into a solid final line. The
+  pane is **virtualised** — a 60-minute meeting is ~750 segments and a 2-hour one ~1,500,
+  independent of headcount, which is more DOM than a naive list should hold.
 - **Double-click a speaker label** — in the transcript or in the sidebar — to rename it.
   The rename applies to every line that speaker has already said and every line they say
   next, because the label is a pointer to a cluster, not a string stored per line.
@@ -207,6 +209,12 @@ somebody else's latency:
    partial interval doubles (1.5 s → 3 s → 6 s → off); below it, the interval walks back down.
    Under sustained load the app degrades to finals-only *by itself*, without an operator, and
    recovers the same way.
+6. **Partials for one concurrent meeting only.** Measured: one 10-person meeting with partials,
+   running alongside a live voicebot call, asks for 55% of the recogniser. A second such
+   meeting takes it to 102% ([scale-test §4](scale-test.md)). So the first meeting to start
+   holds the partial budget; later concurrent meetings run finals-only and say so in the
+   header, and the budget passes on when the holder ends. Finals-only scales to at least three
+   concurrent meetings with a call running.
 
 **Growing-window cost, and the cap on it.** A partial re-transcribes the open segment from its
 start, so one 12 s segment refreshed every 1.5 s submits 1.5 + 3 + … + 12 ≈ 54 s of audio
@@ -215,6 +223,16 @@ The interval therefore **widens as the segment grows**: 1.5 s for the first 6 s,
 ticks at 1.5, 3, 4.5, 6, 9 and 12 s, so 36 s of audio instead of 54 s, a third off for no
 perceptible change. The liveness that matters is at the *start* of a sentence, which is where
 the eye is watching and where the fast cadence is kept.
+
+**Measured cost, per 60-minute meeting** ([scale-test §4](scale-test.md)) — and note that
+none of it changes with headcount, because with one room microphone only one person talks at a
+time, so the audio submitted is bounded by wall-clock speech rather than by how many people
+are in the room:
+
+| | requests/min | audio s/min | × realtime |
+|---|---|---|---|
+| finals only | 12.6 | 52.5 | 0.87× |
+| with partials | 38.0 | 142.2 | 2.37× |
 
 **What the user sees when the governor bites.** The interim line stops updating and the header
 shows a quiet "live text paused — lines still arriving" note. Final lines keep landing ~1.2 s
@@ -239,23 +257,44 @@ Every closed segment goes to the speaker sidecar and comes back as a 192-dim emb
 - **Model:** `speechbrain/spkrec-ecapa-voxceleb` (ECAPA-TDNN, 192-dim). ~20 ms per segment on
   the GPU, ~80 MB of VRAM. NVIDIA TitaNet-L via NeMo is the alternative if NeMo is already on
   the box; ECAPA wins on setup cost.
+- **The embedding window is not the ASR segment.** Transcription wants a tight segment — cut
+  at the silence, cut at the speaker change. Speaker identity wants as much of one continuous
+  voice as it can get. So the segment is transcribed as cut, but embedded over the speaker's
+  **last 4 s of continuous speech**, spanning as many adjacent segments as the turn contains.
+  One extra ring buffer on the gateway; nothing on the GPU. Tested: without this, ten people
+  in an interrupt-heavy meeting produce 129 clusters instead of 10
+  ([scale-test §2](scale-test.md)).
 - **Assignment:** cosine-similarity to existing cluster centroids in the session.
-  - `≥ 0.70` → that cluster.
-  - otherwise → check the **voiceprint library** (§4.3) at a stricter `≥ 0.75`; a hit creates
+  - `≥ 0.60` **and** at least `0.06` clear of the runner-up centroid → that cluster.
+  - otherwise → check the **voiceprint library** (§4.3) at a stricter `≥ 0.70`; a hit creates
     a cluster that is *already named*.
   - otherwise → a new cluster, labelled `Speaker N`.
-- **Centroid update:** duration-weighted running mean. Segments **shorter than 1.5 s are
-  assigned but never update a centroid** — short-clip embeddings are noisy and a run of them
-  drags a centroid onto the wrong person, after which every subsequent segment is misfiled.
+
+  The margin test is what stops a segment that is *nearly* as close to two centroids from
+  being filed under whichever won by a hair. At four speakers it almost never fires; at ten
+  it is the difference between a transcript and a mess.
+- **Segments shorter than 1.5 s are deferred, not guessed at.** They are held and placed
+  against the finished centroids at the end of the meeting. They never update a centroid and —
+  this is the part the first draft got wrong — they are never allowed to *open* one either. A
+  third of all segments are backchannels ("mm", "yeah", "right"), and letting each one that
+  matched nothing start a new speaker is what produced 154 labels for a ten-person meeting.
+- **Centroid update:** duration-weighted running mean, from segments ≥ 1.5 s only.
+- **Re-cluster every 100 segments.** Agglomeratively merge any two centroids closer than
+  `0.72`. Online assignment is causal — it decides on the evidence it had at the time and
+  cannot revisit. This revisits, and it is what turns an early over-split, made when the
+  centroids were young, back into one person.
 - **Turn-change cut:** while a segment is open past ~4 s, embed the trailing 1.5 s window and
   compare to the segment's own leading window. Divergence below 0.6 cuts the segment there,
   so an uninterrupted exchange does not become one block attributed to whoever spoke first.
 
-⚠ **0.70 / 0.75 / 0.6 are starting points from VoxCeleb-scale conventions, not measurements.**
-They must be tuned on real recordings of the actual meeting room and the actual mic — the
-voicebot README is emphatic about exactly this failure mode for ASR, and it applies here.
-Getting them wrong is visible: too low merges two people into one label, too high splits one
-person into `Speaker 2` and `Speaker 5`.
+⚠ **These numbers are calibrated, not conventional — and still not measured on real speech.**
+The first draft said `0.70`, borrowed from a *segment-to-segment* convention and applied to a
+*segment-to-centroid* comparison. [The test run](scale-test.md) found 0.70 to be outside the
+working band at **every** meeting size from 2 to 20 people. The values above come from that
+run; they must still be tuned on real recordings of the actual room and the actual mic, which
+is why they live in config rather than in code. The guards above are what buy room for that
+tuning: they roughly double the width of the usable band and stop it narrowing as people are
+added — 0.14 wide at ten people without them, 0.36 with.
 
 ### 4.2 Offline: refine when the meeting ends
 
@@ -270,7 +309,12 @@ cosine distances between the two spaces are meaningless. Any names the user alre
 travel with the cluster.
 
 Result: labels near the start of the meeting get corrected, and the transcript the minutes are
-generated from is the refined one. Cost: roughly 0.05–0.1× realtime on the GPU, so a 60-minute
+generated from is the refined one. It also escapes a ceiling the online path cannot: the
+re-clustering guard in §4.1 merges anything closer than 0.72, so two genuinely similar voices
+are merged online by construction. pyannote uses different, overlap-aware embeddings and
+global clustering, and is the only automatic thing that can pull them back apart — which is
+why this pass moved from P4 into P2 once the test run showed how much likelier a sound-alike
+pair is in a ten-person room (§4.6). Cost: roughly 0.05–0.1× realtime on the GPU, so a 60-minute
 meeting refines in 3–6 minutes — which is why minutes generation waits for it and the End
 screen shows progress rather than blocking.
 
@@ -308,6 +352,18 @@ library matches scoring ≥ 0.55 as one-tap suggestions. Dismiss once → re-off
 30 s of speech. Dismiss twice → silent for the rest of the meeting, still renameable by
 double-click.
 
+**One card at a time, queued by speaking time.** In a ten-person meeting five voices become
+promptable inside the first two minutes and the rest trickle in over eight
+([scale-test §5](scale-test.md)); five stacked cards is a wall, not a prompt. The queue is
+ordered by how much each person has said, so the voice carrying most of the meeting is named
+first, and the card shows how many are waiting behind it.
+
+⚠ Promptable is a higher bar than clustered. Someone who says 3 s in the whole meeting gets a
+cluster — the test run confirms they are still found — but never a prompt card, because
+prompting on 3 s of audio asks the user to name a voice the system has barely heard. They stay
+`Speaker 7` unless renamed by hand, so the roster must list them even with no card, or they
+are invisible.
+
 ### 4.5 Rename, merge, split
 
 - **Rename** sets `cluster.name`; every segment referencing that cluster re-renders. Nothing
@@ -316,9 +372,36 @@ double-click.
   "merge Speaker 2 into Jimmy Chew?" and, on yes, re-points the segments and merges centroids
   duration-weighted. This is the fix for over-splitting, and it is common enough that it must
   be one click.
-- **Split** is the harder inverse (one cluster that is really two people) and is **out of scope
-  for v1**; the offline refine pass is the answer to most of it. Manual per-segment reassignment
-  from a dropdown covers the rest.
+- **Split** is the harder inverse: one cluster that is really two people. Manual per-segment
+  reassignment from a dropdown, **in P1** — it was deferred out of v1 in the first draft, and
+  the test run withdrew that deferral. The automatic answer is the offline refine pass (§4.2);
+  this is what covers the case it misses, and §4.6 is why ten people cannot ship without it.
+
+### 4.6 ⚠ The one thing ten people makes materially worse
+
+Everything else in this design costs the same at ten people as at four. This does not.
+
+Two speakers whose embeddings sit closer than the re-clustering threshold are merged into one
+cluster, and a sixth of the meeting is then attributed to the wrong person. The test run finds
+a sharp cliff: a pair at cosine 0.70 stays cleanly separate, a pair at 0.75 merges
+([scale-test §3](scale-test.md)). That is the price of the guard that repairs over-split, and
+it is a price worth paying — over-split is certain and constant, sound-alike pairs are
+occasional.
+
+What changes with headcount is how occasional. Four people is **6 speaker pairs**; ten people
+is **45**. If any given pair has even a 1% chance of sitting that close — two colleagues with
+the same accent, register and pitch — the chance of at least one such pair in the room goes
+from 6% to 36%. In a company where colleagues share a first language and an accent, 1% is
+probably optimistic.
+
+So ten people cannot ship on automatic diarization alone. Three things cover it, and all three
+are now in P1–P2 rather than deferred:
+
+- the **offline refine pass** (§4.2), which is not subject to the 0.72 ceiling;
+- **manual per-segment reassignment** (§4.5), for what the refine pass misses;
+- the **voiceprint library** (§4.3) — once both people have been named in any meeting, they
+  are matched against their own stored centroids rather than against each other, which is a
+  different and much easier problem.
 
 ---
 
@@ -365,9 +448,19 @@ the next segment carries 200 ms of overlap so the recogniser has context.
 
 Reuses the same vLLM chat endpoint voicebot uses for its guardrail
 (`POST /v1/chat/completions`, Qwen3.6-35B-A3B on `:8000`), with a much larger `max_tokens` —
-voicebot caps at 220 because it is classifying a single reply; minutes need ~2000.
+voicebot caps at 220 because it is classifying a single reply. Minutes need **3000**: the one
+thing in the minutes path that *does* scale with headcount is the output, since ten attendees
+generate more action items and more names to resolve than four, and the 2000 first drafted was
+tight for that.
 
-Map-reduce, because a 60-minute meeting does not fit a single sensible prompt:
+**Single pass by default; map-reduce above a configured token count.** The first draft
+assumed a 60-minute meeting needed chunking. Measured, it does not: ten people for an hour is
+~7,900 words ≈ 10,600 tokens, and 12,600 with the output — comfortably inside a 32k context
+([scale-test §5](scale-test.md)). A single pass produces better minutes, because nothing has to
+be stitched across a chunk boundary and the model sees the whole arc of the meeting. Chunking
+starts around 2.5 hours.
+
+The map-reduce path is the fallback above that limit:
 
 1. **Map.** Chunk the speaker-attributed transcript into ~4000-token windows with 200-token
    overlap. Each chunk → JSON: `{topics[], decisions[], actions[], questions[], quotes[]}`.
@@ -503,11 +596,13 @@ Not a footnote — this app records people and builds biometric identifiers of t
 | **Overlapping speech** — two people talking at once | Single-channel diarization degrades badly; both get attributed to one label or to neither | pyannote 3.1's overlap-aware pass in the refine step; encourage per-participant mics for remote joins; be honest in the UI that overlaps are approximate |
 | **Far-field room mic** | voicebot's gate thresholds were tuned for a headset on a phone call; a table mic in a boardroom has a different noise floor and 3–5× the reverberation | Re-tune the floor tracker on real room audio; consider Silero VAD instead of the energy gate; make sensitivity a per-room setting |
 | **ASR fabrication over silence** | Fluent invented sentences enter the minutes as things people said | Both voicebot gates, unmodified, on every segment (§3.1) |
-| **Cluster over-split / under-merge** | Transcript reads as 9 speakers in a 4-person meeting | Offline refine; one-click merge; tuned thresholds; short-segment centroid guard |
+| **Cluster over-split** | Transcript reads as 154 speakers in a 10-person meeting — and this was measured, not imagined, on the design's first draft | Corrected threshold, margin test, deferred short segments, periodic re-clustering, rolling embedding window — all four verified in [scale-test](scale-test.md) |
+| **Two people who sound alike** | Merged into one label; a sixth of the meeting attributed to the wrong person. 10 people = 45 speaker pairs vs 4 people's 6, so this is ~6× likelier than at the size the design was first drafted for | Offline refine pass (P2, not P4); manual per-segment split (P1); the voiceprint library, which turns it into a much easier problem once both are named (§4.6) |
 | **Partial-transcript GPU load** | Competes with live voicebot calls on the same recogniser — the box has already produced a 5 ms → 13.6 s turn under exactly this contention | The §3.3 governor: one partial in flight, dropped not queued, adaptive backoff, and suspension while `on_call` is true. **Load-test it against a real call before production** |
 | **Hallucinated action items** | Someone is assigned work they never agreed to | Constrained extraction, `t0` on every item, editable draft, nothing auto-sent |
 | **Accuracy unmeasured** | All model choices here are from published characteristics, not from measurements on this room and these speakers | Benchmark on real recordings before any accuracy claim — voicebot's README makes precisely this mistake visible and refuses to repeat it |
-| **Long meetings** | 2-hour meeting = ~1400 segments, refine pass minutes long, transcript large | Streaming persistence per segment; refine progress in the UI; map-reduce minutes already handles length |
+| **Long meetings** | 2-hour meeting = ~1,500 segments, refine pass minutes long, transcript large | Streaming persistence per segment; virtualised transcript pane; refine progress in the UI; map-reduce above the single-pass token limit |
+| **Meeting size beyond ~20** | Untested above 20 speakers; the usable threshold band was still narrowing at that point | Out of scope — the brief asks for 10. If 30+ is ever wanted, re-run `sim/window_scan.py` first rather than assuming it extrapolates |
 
 ---
 
@@ -516,13 +611,19 @@ Not a footnote — this app records people and builds biometric identifiers of t
 | Phase | Scope | Est. |
 |---|---|---|
 | **P0 — record & transcribe** | WS transport, client capture (lifted), server segmenter, ASR client (lifted), both gates, the §3.3 partial governor and its load test, Start/Pause/End, live transcript, SQLite, mock profile + tests | ~1 week |
-| **P1 — speakers** | Speaker sidecar, ECAPA embeddings, online clustering, coloured labels, double-click rename, merge | ~1.5 weeks |
-| **P2 — identity** | Voiceprint library, cross-meeting recognition, auto-prompt card with clip + suggestions, opt-in enrolment | ~1 week |
-| **P3 — minutes** | Map-reduce generation, JSON schema, Markdown/DOCX export, click-through from minutes to transcript to audio | ~1 week |
-| **P4 — hardening** | Offline pyannote refine, consent flow, retention/deletion, auth, TLS, deploy scripts, threshold tuning on real recordings | ~1 week |
+| **P1 — speakers** | Speaker sidecar, ECAPA embeddings, rolling embedding window, online clustering with all four guards, coloured labels, double-click rename, merge, **and manual per-segment split** (moved in from v1-deferred — see §4.6) | ~2 weeks |
+| **P2 — identity** | Voiceprint library, cross-meeting recognition, queued auto-prompt cards with clip + suggestions, opt-in enrolment, **and the offline pyannote refine pass** (moved forward from P4: it is the only automatic fix for a sound-alike pair, which ten people makes ~6× likelier) | ~1.5 weeks |
+| **P3 — minutes** | Single-pass generation with map-reduce fallback, JSON schema, Markdown/DOCX export, click-through from minutes to transcript to audio | ~1 week |
+| **P4 — hardening** | Consent flow, retention/deletion, auth, TLS, deploy scripts, **threshold tuning on real ten-person recordings**, and the partial-governor load test against a live call | ~1 week |
 
 P0 is independently useful: a recorder that produces a searchable transcript, with speakers
 added later without a rewrite, because segments point at cluster IDs from day one.
+
+P1 grew by half a week and P2 by half a week, both as a direct result of
+[the test run](scale-test.md) — the clustering needs four guards rather than one rule, and two
+things that were deferred out of v1 turned out to be load-bearing at ten people. The algorithm
+those weeks implement is already written and tested in `sim/clustering.py`; what P1 adds around
+it is the sidecar, the audio plumbing and the UI.
 
 ---
 

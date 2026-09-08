@@ -82,17 +82,22 @@ add events without breaking an older page.
 { "kind": "speaker_renamed", "cluster_id": "c3", "name": "Aisha Rahman", "enrolled": true }
 { "kind": "speakers_merged", "from": "c5", "into": "c2", "name": "Aisha Rahman" }
 
-// Roster for the sidebar, sent on change.
+// Roster for the sidebar, sent on change. `promptable` is false for a voice
+// that has been heard but not enough to ask about (under 6 s) — the roster
+// still lists them, or a barely-speaking participant would be invisible.
 { "kind": "roster", "speakers": [
     {"cluster_id": "c1", "name": "Jimmy Chew", "known": true,  "seconds": 812.4, "colour": 0},
-    {"cluster_id": "c3", "name": null,         "known": false, "seconds": 51.4,  "colour": 2} ] }
+    {"cluster_id": "c3", "name": null, "known": false, "seconds": 51.4, "colour": 2,
+     "promptable": true, "queue_position": 1} ] }
 
 { "kind": "state", "state": "recording|paused|refining|generating|done", "elapsed": 843.4 }
 
 // The partial governor (design §3.3) turning live text off and on. Finals are
 // unaffected and keep arriving, so this is a note in the header, not an error.
 { "kind": "interim_state", "active": false,
-  "why": "voicebot_call" }   // voicebot_call | asr_slow | disabled | large_meeting
+  "why": "other_meeting" }
+  // voicebot_call | asr_slow | disabled | other_meeting
+  // other_meeting: another meeting holds the partial budget (one at a time)
 { "kind": "status", "text": "Mic went quiet — check the input device" }
 
 // Post-End progress and completion.
@@ -296,6 +301,7 @@ asr:
   final_timeout_s: 30                    # finals are the product; never dropped
 partials:
   enabled: true
+  max_concurrent_meetings: 1             # measured: a 2nd meeting takes the ASR to 102%
   interval_ms: 1500                      # refresh cadence for the open segment
   interval_ms_after_6s: 3000             # widen as the segment grows (cost, not liveness)
   timeout_s: 1.2                         # a late partial is worthless — drop, never retry
@@ -308,15 +314,26 @@ partials:
     poll_seconds: 5
 speaker:
   base_url: http://127.0.0.1:8803
-  match_threshold: 0.70                  # same-cluster, within a meeting
-  library_threshold: 0.75                # cross-meeting identification — stricter
+  # Calibrated in sim/, not borrowed: the first draft's 0.70 was a
+  # segment-to-segment convention applied to a segment-to-centroid comparison,
+  # and it produced 154 clusters for a 10-person meeting. See docs/scale-test.md.
+  match_threshold: 0.60                  # same-cluster, within a meeting
+  match_margin: 0.06                     # ...and this much clear of the runner-up
+  library_threshold: 0.70                # cross-meeting identification — stricter
   turn_change_threshold: 0.60
-  min_centroid_seconds: 1.5              # shorter clips are assigned, never learned from
+  min_centroid_seconds: 1.5              # shorter clips never update a centroid
+  defer_under_seconds: 1.5               # ...and never open one: they are held to the end
+  embed_window_seconds: 4.0              # embed the turn, not the ASR segment
+  recluster_every_segments: 100          # agglomerative repair pass
+  recluster_threshold: 0.72              # merge centroids closer than this
 llm:
   base_url: http://127.0.0.1:8000        # the voicebot LLM, shared
   model: Qwen/Qwen3.6-35B-A3B
-  max_tokens: 2000
+  max_tokens: 3000                       # 10 attendees produce more actions than 4
   temperature: 0.2
+  # An hour of ten people is ~10,600 tokens and fits one pass, which produces
+  # better minutes than stitching chunks. Chunk only above this.
+  single_pass_max_tokens: 24000
 segmenter:
   silence_ms: 600
   max_segment_s: 12
@@ -326,6 +343,7 @@ prompt:
   min_seconds: 6.0
   min_segments: 2
   redisplay_after_seconds: 30
+  max_visible: 1                         # queued, ordered by speaking time
 retention:
   audio_days: 30
   transcript_days: 365
@@ -342,4 +360,6 @@ MINUTES_AUDIO_DIR=/var/lib/minutes/audio
 ```
 
 The thresholds are in config rather than in code specifically because §4.1 of the design says
-they must be tuned against the real room — tuning them should not need a redeploy.
+they must be tuned against the real room — tuning them should not need a redeploy. The values
+above are the ones `sim/` measured; `sim/window_scan.py` reports how much room each has before
+the transcript degrades, which is the number to check after re-tuning.
