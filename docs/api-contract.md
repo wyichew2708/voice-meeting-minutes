@@ -88,6 +88,11 @@ add events without breaking an older page.
     {"cluster_id": "c3", "name": null,         "known": false, "seconds": 51.4,  "colour": 2} ] }
 
 { "kind": "state", "state": "recording|paused|refining|generating|done", "elapsed": 843.4 }
+
+// The partial governor (design §3.3) turning live text off and on. Finals are
+// unaffected and keep arriving, so this is a note in the header, not an error.
+{ "kind": "interim_state", "active": false,
+  "why": "voicebot_call" }   // voicebot_call | asr_slow | disabled | large_meeting
 { "kind": "status", "text": "Mic went quiet — check the input device" }
 
 // Post-End progress and completion.
@@ -219,8 +224,22 @@ Content-Type: multipart/form-data
 ```
 
 Called exactly as `voicebot/src/voicebot/runtime/cuda_backend.py:74-104` calls it —
-hand-rolled multipart, blocking `urllib` on a small thread pool, 30 s timeout. No change to
-the service, no second copy of the model.
+hand-rolled multipart, blocking `urllib` on a small thread pool. No change to the service and
+no second copy of the model: **this one endpoint serves finals, partials and voicebot's live
+calls.** Finals use the 30 s timeout that client already has; partials go through the governor
+(`partials:` above) with a 1.2 s timeout, one in flight, and are dropped rather than queued.
+
+### 4.1b voicebot health — read-only, for yielding
+
+```
+GET http://127.0.0.1:8788/api/health
+-> {"profile": "cuda", "asr": "…", "ready": true, "on_call": true, …}
+```
+
+`on_call` is voicebot's existing signal that a customer call is in progress; its own pre-render
+warm-up already blocks on it. The gateway polls it every 5 s and suspends partials while it is
+true. If the endpoint is unreachable the gateway **assumes a call is live** and keeps partials
+suspended — failing toward the customer's latency rather than toward our nice-to-have.
 
 ### 4.2 Speaker sidecar — new, `:8803`
 
@@ -269,9 +288,24 @@ profile: rhel
 audio:
   sample_rate: 16000
 asr:
-  base_url: http://127.0.0.1:8801        # the voicebot ASR, shared
+  # The voicebot ASR, shared. Finals and partials both go here — there is no
+  # second replica. See solution-design.md §3.3 for why, and for the governor
+  # below that keeps partials off a live call's back.
+  base_url: http://127.0.0.1:8801
   model: MERaLiON/MERaLiON-3-3B-ASR
-  interim_base_url: null                 # optional second replica for partials
+  final_timeout_s: 30                    # finals are the product; never dropped
+partials:
+  enabled: true
+  interval_ms: 1500                      # refresh cadence for the open segment
+  interval_ms_after_6s: 3000             # widen as the segment grows (cost, not liveness)
+  timeout_s: 1.2                         # a late partial is worthless — drop, never retry
+  max_in_flight: 1                       # per meeting, never queued
+  backoff_p50_ms: 900                    # above this, double the interval; below, halve it
+  # voicebot publishes `on_call` for exactly this — its own warm-up stands aside
+  # on the same signal. Partials suspend while a call is live; finals do not.
+  yield_to:
+    health_url: http://127.0.0.1:8788/api/health
+    poll_seconds: 5
 speaker:
   base_url: http://127.0.0.1:8803
   match_threshold: 0.70                  # same-cluster, within a meeting
@@ -300,6 +334,7 @@ retention:
 ```
 MINUTES_PROFILE=rhel
 MINUTES_ASR_URL=http://127.0.0.1:8801
+MINUTES_VOICEBOT_HEALTH_URL=http://127.0.0.1:8788/api/health   # unset to disable yielding
 MINUTES_SPEAKER_URL=http://127.0.0.1:8803
 MINUTES_LLM_URL=http://127.0.0.1:8000
 MINUTES_DB=/var/lib/minutes/minutes.db

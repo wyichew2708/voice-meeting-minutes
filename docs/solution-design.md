@@ -73,6 +73,7 @@ flowchart LR
   subgraph Gateway["Minutes gateway — CPU, FastAPI :8790"]
     SEG[segmenter<br/>VAD + turn cut]
     ORCH[session orchestrator]
+    GOV{{partial governor<br/>1 in flight · backoff<br/>yields to live calls}}
     CLU[online clustering<br/>+ voiceprint match]
     STORE[(SQLite + WAV)]
   end
@@ -81,11 +82,14 @@ flowchart LR
     ASR["ASR :8801<br/>vLLM · MERaLiON-3-3B<br/>REUSED from voicebot"]
     EMB["speaker sidecar :8803<br/>ECAPA-TDNN + pyannote<br/>NEW"]
     LLM["LLM :8000<br/>vLLM · Qwen3.6-35B-A3B<br/>REUSED from voicebot"]
+    VB["voicebot console :8788<br/>/api/health -> on_call"]
   end
 
   MIC --> VAD -->|binary WS frames| SEG
   SEG --> ORCH
-  ORCH -->|wav| ASR
+  ORCH -->|wav · finals, ungoverned| ASR
+  ORCH --> GOV -->|wav · partials| ASR
+  VB -.->|on_call| GOV
   ORCH -->|wav| EMB
   EMB --> CLU --> ORCH
   ORCH --> STORE
@@ -134,7 +138,7 @@ Content-Type: multipart/form-data
 No change to that service is required, and no second copy of the model is loaded. The new app
 points `MINUTES_ASR_URL` at the same address.
 
-### What is lifted from voicebot, and how
+### 3.1 What is lifted from voicebot, and how
 
 | Piece | voicebot source | Reuse |
 |---|---|---|
@@ -146,6 +150,7 @@ points `MINUTES_ASR_URL` at the same address.
 | Env-override config loader (`VOICEBOT_ASR_URL` pattern) | `config.py` | adapt naming to `MINUTES_*` |
 | Language detection from transcript text | `lang.py` | verbatim |
 | Per-session JSONL event recorder | `recording.py`, `events.py` | adapt — meetings persist to SQLite, but the JSONL audit trail is worth keeping |
+| `on_call` yield signal, and the reasoning behind it | `server.py:145`, `server.py:320-328` | **consumed as an API** — the gateway polls it to suspend partials while a call is live (§3.3) |
 
 **The audio gates are not optional.** voicebot's own notes are blunt about why: fed silence or
 room noise, Whisper-family models return fluent invented sentences rather than nothing, and
@@ -153,27 +158,73 @@ everything downstream believes them (`audio_gate.py:1-11`). In a call that produ
 turn. In a 60-minute meeting transcript it produces dozens of confident fabrications that then
 get summarised into minutes as if someone had said them. Both gates run on every segment.
 
-### ⚠ Two real gaps in the reused ASR
+### 3.2 ⚠ Two real gaps in the reused ASR
 
 1. **No word- or segment-level timestamps.** The endpoint returns text only. All timing in
    this product therefore comes from *our* VAD boundaries — accurate to the segment (±100 ms),
    not to the word. Good enough for minutes, speaker attribution and a clickable transcript;
-   **not** good enough for karaoke-style word highlighting. If word timing is wanted later,
-   either run a forced aligner (WhisperX / MFA) over the recording in the post-processing pass,
-   or stand up a second ASR replica that emits timestamps.
+   **not** good enough for karaoke-style word highlighting. If word timing is wanted later, run
+   a forced aligner (WhisperX / MFA) over the recording during the post-processing pass — it is
+   CPU work on a finished file, so it costs the shared GPU nothing.
 
 2. **Utterance-scoped, not streaming.** vLLM's transcription endpoint takes a whole clip and
    returns whole text. To get the Zoom-like interim line we re-send the *open* segment's audio
-   every ~1.5 s and replace the partial. That multiplies ASR requests per minute by roughly
-   4–8×. Mitigations, in preference order:
-   - run partials against a **second, small ASR replica** (Whisper-turbo class) and finals
-     against MERaLiON — partials only need to look plausible while they are on screen;
-   - cap partial refresh to one in flight per session, drop rather than queue;
-   - make interim transcription a per-meeting toggle for large meetings.
+   every ~1.5 s and replace the partial. Since that goes to the same shared endpoint (§3.3),
+   the governor below is what keeps it from costing anyone else anything.
 
-   ⚠ **Decision needed:** is the second ASR replica acceptable on that GPU, or do we ship v1
-   with finals-only (line appears ~1.2 s after each person stops talking, no live typing
-   effect)? Finals-only is materially cheaper and still reads well.
+### 3.3 Sharing one ASR endpoint with live voicebot calls
+
+**Decided: one endpoint, no second replica.** Both partials and finals go to the MERaLiON
+instance voicebot already hosts on `:8801`. That keeps VRAM allocation untouched and means
+there is exactly one ASR to operate, patch and monitor.
+
+The cost of that decision has to be paid somewhere, and the place it would otherwise land is a
+live voicebot call. That box has already demonstrated the failure precisely: voicebot's own
+pre-render warm-up notes that *"a turn that reads from a warm cache in 5 ms took 13.6 seconds
+with a warm-up running behind it"* (`server.py:320-328`). GPU contention on this machine is not
+theoretical, and a minutes app quietly generating partials is exactly the shape of background
+job that caused it.
+
+So partial transcription runs under a **governor**, and every rule in it exists to protect
+somebody else's latency:
+
+1. **One partial in flight per meeting, never queued.** If the previous partial has not
+   returned when the next 1.5 s tick arrives, the tick is skipped. This bounds partial
+   concurrency to the number of people currently mid-sentence, not to the tick rate.
+2. **Partials use a short timeout and are dropped, not retried.** 1.2 s against the finals'
+   30 s. A partial that is late is worthless — the audio it describes has already been
+   superseded — so abandoning it is free, and it stops a busy queue from getting busier.
+3. **Finals are never governed.** They are the product; they get the full timeout, unbounded
+   retries and priority in the gateway's own dispatch. A meeting always ends with a complete
+   transcript even if not one partial ever rendered.
+4. **Yield while a voicebot call is live.** voicebot's health endpoint already publishes
+   `on_call` for exactly this purpose — its own comment says it is there *"so a warm-up running
+   outside this process can stand aside too"* (`server.py:145`). The gateway polls
+   `http://127.0.0.1:8788/api/health` every 5 s and suspends partials while `on_call` is true.
+   Finals continue: they are one short request per utterance and are the same order of load as
+   the call itself.
+5. **Adaptive backoff.** The gateway tracks its own ASR round-trip time. Above a 900 ms p50 the
+   partial interval doubles (1.5 s → 3 s → 6 s → off); below it, the interval walks back down.
+   Under sustained load the app degrades to finals-only *by itself*, without an operator, and
+   recovers the same way.
+
+**Growing-window cost, and the cap on it.** A partial re-transcribes the open segment from its
+start, so one 12 s segment refreshed every 1.5 s submits 1.5 + 3 + … + 12 ≈ 54 s of audio
+against the final's 12 s — 4.5×, and that ratio, not the request count, is the real GPU cost.
+The interval therefore **widens as the segment grows**: 1.5 s for the first 6 s, then 3 s —
+ticks at 1.5, 3, 4.5, 6, 9 and 12 s, so 36 s of audio instead of 54 s, a third off for no
+perceptible change. The liveness that matters is at the *start* of a sentence, which is where
+the eye is watching and where the fast cadence is kept.
+
+**What the user sees when the governor bites.** The interim line stops updating and the header
+shows a quiet "live text paused — lines still arriving" note. Final lines keep landing ~1.2 s
+after each person stops talking, which is what makes the transcript feel live in the first
+place. Nothing is lost, and nothing needs to be re-recorded.
+
+⚠ This is the one part of the design that must be **load-tested before it goes near a
+production voicebot call**: run a 4-person meeting with partials on while a call is in
+progress, and measure the call's turn latency, not the meeting's. If the governor is not
+enough, the next lever is partials off by default rather than a second replica.
 
 ---
 
@@ -404,11 +455,14 @@ Onto the existing RHEL box, alongside voicebot, nothing displaced:
 
 | Service | Port | Status | VRAM |
 |---|---|---|---|
-| ASR — vLLM, MERaLiON-3-3B | 8801 | **existing, shared** | ~0.22 util (already allocated) |
+| ASR — vLLM, MERaLiON-3-3B | 8801 | **existing, shared** — carries finals *and* partials (§3.3) | ~0.22 util (already allocated) |
 | LLM — vLLM, Qwen3.6-35B-A3B | 8000 | **existing, shared** | already allocated |
+| voicebot console — read for `on_call` | 8788 | **existing**, read-only | none |
 | Speaker sidecar — ECAPA + pyannote | 8803 | **new** | ~1.5 GB |
 | Minutes gateway — FastAPI | 8790 | **new** | none (CPU) |
-| *(optional)* partials ASR replica | 8804 | decision pending §3 | ~2 GB |
+
+Total new VRAM: **~1.5 GB**, all of it the speaker sidecar. No new ASR, no new LLM, and no
+change to voicebot's existing allocation.
 
 All GPU services stay bound to `127.0.0.1` exactly as voicebot binds them
 (`deploy/rhel/services.sh`); the gateway is the only port that leaves the host, behind TLS and
@@ -448,9 +502,9 @@ Not a footnote — this app records people and builds biometric identifiers of t
 |---|---|---|
 | **Overlapping speech** — two people talking at once | Single-channel diarization degrades badly; both get attributed to one label or to neither | pyannote 3.1's overlap-aware pass in the refine step; encourage per-participant mics for remote joins; be honest in the UI that overlaps are approximate |
 | **Far-field room mic** | voicebot's gate thresholds were tuned for a headset on a phone call; a table mic in a boardroom has a different noise floor and 3–5× the reverberation | Re-tune the floor tracker on real room audio; consider Silero VAD instead of the energy gate; make sensitivity a per-room setting |
-| **ASR fabrication over silence** | Fluent invented sentences enter the minutes as things people said | Both voicebot gates, unmodified, on every segment (§3) |
+| **ASR fabrication over silence** | Fluent invented sentences enter the minutes as things people said | Both voicebot gates, unmodified, on every segment (§3.1) |
 | **Cluster over-split / under-merge** | Transcript reads as 9 speakers in a 4-person meeting | Offline refine; one-click merge; tuned thresholds; short-segment centroid guard |
-| **Partial-transcript GPU load** | Competes with live voicebot calls on the same box | Second small replica, or finals-only mode (§3) |
+| **Partial-transcript GPU load** | Competes with live voicebot calls on the same recogniser — the box has already produced a 5 ms → 13.6 s turn under exactly this contention | The §3.3 governor: one partial in flight, dropped not queued, adaptive backoff, and suspension while `on_call` is true. **Load-test it against a real call before production** |
 | **Hallucinated action items** | Someone is assigned work they never agreed to | Constrained extraction, `t0` on every item, editable draft, nothing auto-sent |
 | **Accuracy unmeasured** | All model choices here are from published characteristics, not from measurements on this room and these speakers | Benchmark on real recordings before any accuracy claim — voicebot's README makes precisely this mistake visible and refuses to repeat it |
 | **Long meetings** | 2-hour meeting = ~1400 segments, refine pass minutes long, transcript large | Streaming persistence per segment; refine progress in the UI; map-reduce minutes already handles length |
@@ -461,7 +515,7 @@ Not a footnote — this app records people and builds biometric identifiers of t
 
 | Phase | Scope | Est. |
 |---|---|---|
-| **P0 — record & transcribe** | WS transport, client capture (lifted), server segmenter, ASR client (lifted), both gates, Start/Pause/End, live transcript, SQLite, mock profile + tests | ~1 week |
+| **P0 — record & transcribe** | WS transport, client capture (lifted), server segmenter, ASR client (lifted), both gates, the §3.3 partial governor and its load test, Start/Pause/End, live transcript, SQLite, mock profile + tests | ~1 week |
 | **P1 — speakers** | Speaker sidecar, ECAPA embeddings, online clustering, coloured labels, double-click rename, merge | ~1.5 weeks |
 | **P2 — identity** | Voiceprint library, cross-meeting recognition, auto-prompt card with clip + suggestions, opt-in enrolment | ~1 week |
 | **P3 — minutes** | Map-reduce generation, JSON schema, Markdown/DOCX export, click-through from minutes to transcript to audio | ~1 week |
@@ -474,8 +528,9 @@ added later without a rewrite, because segments point at cluster IDs from day on
 
 ## 12. Decisions needed before implementation
 
-1. **Interim transcripts** — second small ASR replica for the live-typing effect, or
-   finals-only in v1? (§3)
+1. ~~**Interim transcripts** — second small ASR replica, or finals-only?~~ **Decided:**
+   reuse the single ASR endpoint voicebot already hosts, for both partials and finals, under
+   the governor in §3.3. No second replica. Remaining work is the load test named there.
 2. **pyannote gating** — is a Hugging Face token and accepted model terms acceptable on that
    host, or do the weights need vendoring? (§4.2)
 3. **Languages** — English only, or the same `[en, zh]` set voicebot serves, plus Singlish?
