@@ -1,0 +1,176 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Meeting Minutes</title>
+<link rel="stylesheet" href="css/styles.css">
+</head>
+<body>
+
+<header>
+  <div class="brand">
+    <span id="mic" class="mic" aria-hidden="true"></span>
+    <h1>Voice Meeting Minutes</h1>
+    <span id="embedBadge" class="badge"></span>
+  </div>
+  <div class="controls">
+    <button id="start" class="primary">Start</button>
+    <button id="pause" hidden>Pause</button>
+    <button id="end" hidden class="danger">End</button>
+    <button id="generate" disabled>Write minutes</button>
+    <button id="openSettings" class="ghost" title="Settings">Settings</button>
+  </div>
+</header>
+
+<div class="meter"><div id="meterFill"></div></div>
+<p id="status" class="status">ready</p>
+
+<main>
+  <section class="pane">
+    <div class="paneHead">
+      <h2>Transcript</h2>
+      <div id="speakers" class="speakers"></div>
+    </div>
+    <div id="transcript" class="transcript"></div>
+    <div id="interim" class="interim"></div>
+    <div class="paneFoot">
+      <button id="exportTxt" class="ghost">Export transcript</button>
+      <span class="hint">Double-click a speaker label to name them — it applies to every line they have already said, and they are recognised in your next meeting.</span>
+    </div>
+  </section>
+
+  <section id="minutesPane" class="pane" hidden>
+    <div class="paneHead"><h2>Minutes <span class="draft">draft</span></h2></div>
+    <div id="minutesBody" class="minutes"></div>
+    <div class="paneFoot">
+      <button id="exportMd" class="ghost">Export Markdown</button>
+      <span class="hint warn">Generated from an automatic transcript. Action items are the most likely thing to be wrong — check each one against the timestamp before circulating.</span>
+    </div>
+  </section>
+</main>
+
+<dialog id="consent">
+  <h2>Before you record</h2>
+  <p>This records everyone in the room. Tell them, and get their agreement — in
+     many places that is a legal requirement, not a courtesy.</p>
+  <p>Recordings, transcripts and voiceprints are stored <strong>in this browser
+     on this machine</strong>. Nothing is uploaded except the transcript text,
+     which is sent to the minutes API you configure, when you press
+     <em>Write minutes</em>.</p>
+  <p id="consentEngine" class="note warn">If you use the browser recogniser,
+     microphone audio is also sent to Google for transcription. Switch the
+     engine to Whisper in Settings to keep audio on this machine.</p>
+  <form method="dialog" class="row end">
+    <button value="cancel" class="ghost">Cancel</button>
+    <button id="acceptConsent" value="ok" class="primary">Everyone has agreed — start</button>
+  </form>
+</dialog>
+
+<dialog id="settings">
+  <h2>Settings</h2>
+
+  <h3>Speech recognition</h3>
+  <label>Engine
+    <select id="asrEngine">
+      <option value="webspeech">Browser recognition — nothing to download</option>
+      <option value="whisper">Whisper Singlish — local, downloads once</option>
+    </select>
+  </label>
+  <p id="privacyNote" class="note"></p>
+
+  <div id="webspeechRow">
+    <label>Language
+      <select id="asrLang">
+        <option value="en-SG">English (Singapore)</option>
+        <option value="en-GB">English (UK)</option>
+        <option value="en-US">English (US)</option>
+        <option value="zh-CN">Chinese</option>
+        <option value="ms-MY">Malay</option>
+        <option value="ta-IN">Tamil</option>
+      </select>
+    </label>
+    <p class="note">Whether <code>en-SG</code> reaches a Singapore-tuned recogniser is
+       undocumented, and there is no Singlish finetune behind it either way.</p>
+  </div>
+
+  <div id="whisperRow" hidden>
+    <label>Model
+      <select id="whisperModel">
+        <option value="mjwong/whisper-small-singlish">whisper-small-singlish — 0.2B, 18.5% WER, Apache-2.0</option>
+        <option value="mjwong/whisper-large-v3-turbo-singlish">whisper-large-v3-turbo-singlish — 0.8B, 13.3% WER, MIT</option>
+        <option value="local/whisper-singlish-onnx">local export (web/models/)</option>
+        <option value="onnx-community/whisper-base">whisper-base — no Singlish tuning, for comparison</option>
+      </select>
+    </label>
+    <div class="row">
+      <label>Precision
+        <select id="whisperDtype">
+          <option value="q8">q8 — smallest</option>
+          <option value="fp16">fp16</option>
+          <option value="fp32">fp32 — largest</option>
+        </select>
+      </label>
+      <label>Device
+        <select id="whisperDevice">
+          <option value="webgpu">WebGPU</option>
+          <option value="wasm">WASM — slower, works everywhere</option>
+        </select>
+      </label>
+    </div>
+    <p class="note warn">The Singlish models ship safetensors, not ONNX. Convert once with
+       <code>tools/export_singlish_onnx.py</code> and pick <em>local export</em>, or the
+       Hub entries above will fail to load.</p>
+  </div>
+
+  <h3>Speaker identification</h3>
+  <label>Embedder
+    <select id="embedBackend">
+      <option value="spectral">Built-in approximate — nothing to download</option>
+      <option value="onnx">ECAPA-TDNN (ONNX) — as the design specifies</option>
+    </select>
+  </label>
+  <div id="onnxRow" hidden>
+    <label>Model URL
+      <input id="embedOnnxUrl" type="url" placeholder="models/ecapa.onnx" spellcheck="false">
+    </label>
+  </div>
+  <p class="note warn">The clustering thresholds are calibrated for ECAPA's geometry.
+     The built-in embedder separates clearly different voices but is not a
+     speaker-verification model — expect to rename people by hand.</p>
+
+  <h3>Minutes API</h3>
+  <label>Base URL
+    <input id="llmBaseUrl" type="url" placeholder="https://api.openai.com" spellcheck="false">
+  </label>
+  <label>API key
+    <input id="llmApiKey" type="password" placeholder="sk-…" spellcheck="false" autocomplete="off">
+  </label>
+  <div class="row">
+    <label>Model
+      <input id="llmModel" type="text" placeholder="gpt-4o-mini" spellcheck="false">
+    </label>
+    <label>Wire format
+      <select id="llmFormat">
+        <option value="auto">Auto</option>
+        <option value="openai">OpenAI /v1/chat/completions</option>
+        <option value="anthropic">Anthropic /v1/messages</option>
+      </select>
+    </label>
+  </div>
+  <div class="row">
+    <button id="testApi" class="ghost">Test connection</button>
+    <span id="apiResult" class="result"></span>
+  </div>
+  <p class="note warn">The key is stored in this browser and sent to the base URL above,
+     from this page. A wrong base URL is a leaked key. Anything speaking the OpenAI
+     chat-completions shape works — including a vLLM or Ollama server on your own network.</p>
+
+  <form method="dialog" class="row end">
+    <button value="ok" class="primary">Done</button>
+  </form>
+</dialog>
+
+<script type="module" src="js/app.js"></script>
+</body>
+</html>

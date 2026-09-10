@@ -4,7 +4,14 @@ A browser app that records a meeting live, transcribes it in real time, works ou
 speaking, asks you to name the voices it does not recognise, and writes the minutes when the
 meeting ends.
 
-**Status: design draft. No code yet.**
+**Status: design draft, plus a runnable browser-only build.**
+
+The design below targets the RHEL GPU box and is still the plan of record.
+A second, self-contained version runs entirely in the browser — no gateway, no
+GPU box, an LLM API you supply — and is the fastest way to actually use this:
+**[`web/`](web/)**, written up in **[docs/html-version.md](docs/html-version.md)**.
+It trades MERaLiON for a Singlish Whisper finetune and, unless you load ECAPA,
+does not meet the ten-person bar. Both limits are measured, not assumed.
 
 - **[docs/solution-design.md](docs/solution-design.md)** — architecture, models, speaker
   identification, minutes generation, deployment, risks, delivery plan

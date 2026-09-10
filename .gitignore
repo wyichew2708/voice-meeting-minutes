@@ -1,2 +1,5 @@
 __pycache__/
 *.pyc
+
+# Converted model weights — hundreds of MB, rebuilt with tools/export_singlish_onnx.py
+web/models/
