@@ -68,7 +68,7 @@ export class MinutesClient {
     return /anthropic\.com/i.test(this.cfg.baseUrl || '') ? 'anthropic' : 'openai';
   }
 
-  async _chat(system, user, { maxTokens = MAX_TOKENS, signal } = {}) {
+  async _chat(system, user, { maxTokens = MAX_TOKENS, signal, json = false } = {}) {
     const base = (this.cfg.baseUrl || '').replace(/\/+$/, '');
     if (!base) throw new Error('No API base URL configured.');
     if (this.format === 'anthropic') {
@@ -90,19 +90,30 @@ export class MinutesClient {
       return (j.content || []).map(c => c.text || '').join('');
     }
 
-    const r = await fetch(`${base}/v1/chat/completions`, {
+    const body = {
+      model: this.cfg.model,
+      max_tokens: maxTokens,
+      temperature: 0.2,
+      messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
+    };
+    // JSON mode where the server has it (OpenAI, vLLM, Groq, OpenRouter…).
+    // Servers that do not know the parameter tend to 400 naming it; retry
+    // without rather than fail a meeting over a feature flag.
+    if (json) body.response_format = { type: 'json_object' };
+    const post = () => fetch(`${base}/v1/chat/completions`, {
       method: 'POST', signal,
       headers: {
         'content-type': 'application/json',
         ...(this.cfg.apiKey ? { authorization: `Bearer ${this.cfg.apiKey}` } : {}),
       },
-      body: JSON.stringify({
-        model: this.cfg.model,
-        max_tokens: maxTokens,
-        temperature: 0.2,
-        messages: [{ role: 'system', content: system }, { role: 'user', content: user }],
-      }),
+      body: JSON.stringify(body),
     });
+    let r = await post();
+    if (!r.ok && json && r.status === 400) {
+      const txt = await r.text();
+      if (/response_format/i.test(txt)) { delete body.response_format; r = await post(); }
+      else throw new Error(`400 ${txt.slice(0, 300)}`);
+    }
     if (!r.ok) throw new Error(`${r.status} ${(await r.text()).slice(0, 300)}`);
     const j = await r.json();
     return j.choices?.[0]?.message?.content ?? '';
@@ -121,7 +132,7 @@ export class MinutesClient {
 
     if (tokens <= SINGLE_PASS_TOKEN_LIMIT) {
       onStage?.(`single pass · ~${tokens.toLocaleString()} tokens`);
-      const raw = await this._chat(SYSTEM, `${schemaBlock(meta)}\n\nTRANSCRIPT\n${flat}`, { signal });
+      const raw = await this._chat(SYSTEM, `${schemaBlock(meta)}\n\nTRANSCRIPT\n${flat}`, { signal, json: true });
       return finalise(parseJson(raw), meta);
     }
 
@@ -131,7 +142,7 @@ export class MinutesClient {
     const partials = [];
     for (let i = 0; i < chunks.length; i++) {
       onStage?.(`map ${i + 1}/${chunks.length}`);
-      const raw = await this._chat(MAP_SYSTEM, renderTranscript(chunks[i]), { maxTokens: 1500, signal });
+      const raw = await this._chat(MAP_SYSTEM, renderTranscript(chunks[i]), { maxTokens: 1500, signal, json: true });
       partials.push(parseJson(raw));
     }
     onStage?.('reduce');
@@ -140,7 +151,7 @@ export class MinutesClient {
       `${schemaBlock(meta)}\n\nThese are extracts from consecutive passages of one meeting. ` +
       `Deduplicate, order them, and write the meeting document. Keep every t0.\n\n` +
       JSON.stringify(partials),
-      { signal });
+      { signal, json: true });
     return finalise(parseJson(raw), meta);
   }
 }
@@ -198,11 +209,76 @@ function finalise(m, meta) {
   };
 }
 
+/* ── Grounding ───────────────────────────────────────────────────────────────
+ *
+ * §6: "hallucinated action items are the real risk here, more than
+ * transcription errors." The prompt asks for t0 on every decision and action
+ * so a reader can check them; this does the first pass of that checking
+ * automatically, so the reader's attention goes to the items that need it.
+ *
+ * For each item: is there transcript within `window` seconds of its t0, and
+ * do the item's content words appear in it? Three outcomes —
+ *   ok         source found, vocabulary overlaps
+ *   weak       source found, little overlap: a paraphrase, or an invention
+ *   no-source  nothing said near that time, or no t0 at all
+ * Nothing is deleted. The flags are rendered so a human decides; an item the
+ * model made up and an item it paraphrased heavily look the same to a
+ * word-overlap test, and only the reader can tell them apart.
+ */
+const STOP = new Set(('the a an and or but of to in on at for with we i you it is are was were be been being ' +
+  'this that these those will would should can could may might our your their they he she them us do does did ' +
+  'not no yes so if then than as by from about into over after before up down out just also very really').split(' '));
+// Content words, reduced to a 4-letter prefix as a poor man's stem: "temps"
+// and "temporary" both become "temp", "review" and "revisit" both "revi", so
+// an honest paraphrase is not flagged as an invention. A made-up item still
+// shares nothing with what was said and still scores near zero.
+const content = (s) => String(s || '').toLowerCase().replace(/[^\p{L}\p{N}' ]+/gu, ' ')
+  .split(/\s+/).filter(w => w.length > 2 && !STOP.has(w)).map(w => w.slice(0, 4));
+
+export function groundMinutes(m, lines, { window = 20, minOverlap = 0.34 } = {}) {
+  const check = (item) => {
+    if (!item || typeof item !== 'object') return item;
+    const t0 = Number(item.t0);
+    if (!Number.isFinite(t0)) return { ...item, _grounding: 'no-source', _why: 'no t0' };
+    const near = lines.filter(l => Math.abs(l.t0 - t0) <= window)
+                      .sort((a, b) => Math.abs(a.t0 - t0) - Math.abs(b.t0 - t0));
+    if (!near.length) return { ...item, _grounding: 'no-source', _why: 'nothing said near that time' };
+    const hay = new Set(near.flatMap(l => content(l.text)));
+    const needles = content(item.text || item.heading);
+    const hit = needles.length ? needles.filter(w => hay.has(w)).length / needles.length : 1;
+    return { ...item, _grounding: hit >= minOverlap ? 'ok' : 'weak', _overlap: hit, _source: near[0] };
+  };
+  const out = {
+    ...m,
+    topics: (m.topics || []).map(check),
+    decisions: (m.decisions || []).map(check),
+    actions: (m.actions || []).map(check),
+  };
+  const all = [...out.decisions, ...out.actions];
+  out._grounding = {
+    total: all.length,
+    ok: all.filter(x => x._grounding === 'ok').length,
+    weak: all.filter(x => x._grounding === 'weak').length,
+    unsourced: all.filter(x => x._grounding === 'no-source').length,
+  };
+  return out;
+}
+
+const flag = (x, hhmm) => x._grounding === 'weak' ? ` ⚠ *unverified — check ${hhmm(x.t0)}*`
+                        : x._grounding === 'no-source' ? ` ⚠ *no source in transcript*` : '';
+
 export function toMarkdown(m) {
   const hhmm = (s) => `${String(Math.floor(s / 60)).padStart(2, '0')}:${String(Math.floor(s % 60)).padStart(2, '0')}`;
   const L = [`# ${m.title}`, '', `**Date** ${m.date} · **Duration** ${hhmm(m.duration_seconds)}`, ''];
   if (m.attendees?.length) {
     L.push('**Attendees** ' + m.attendees.map(a => `${a.name} (${hhmm(a.speaking_seconds)})`).join(', '), '');
+  }
+  if (m._grounding?.total) {
+    const g = m._grounding;
+    const flagged = g.weak + g.unsourced;
+    L.push(flagged
+      ? `> **Grounding:** ${g.ok} of ${g.total} decisions and actions verified against the transcript; **${flagged} flagged** — check those first.`
+      : `> **Grounding:** all ${g.total} decisions and actions verified against the transcript.`, '');
   }
   L.push('## Summary', '', m.summary, '');
   if (m.topics?.length) {
@@ -215,12 +291,12 @@ export function toMarkdown(m) {
   }
   if (m.decisions?.length) {
     L.push('## Decisions', '');
-    for (const d of m.decisions) L.push(`- ${d.text}${d.speaker ? ` — *${d.speaker}*` : ''}${d.t0 != null ? ` (${hhmm(d.t0)})` : ''}`);
+    for (const d of m.decisions) L.push(`- ${d.text}${d.speaker ? ` — *${d.speaker}*` : ''}${d.t0 != null ? ` (${hhmm(d.t0)})` : ''}${flag(d, hhmm)}`);
     L.push('');
   }
   if (m.actions?.length) {
     L.push('## Action items', '', '| Owner | Action | Due | At |', '|---|---|---|---|');
-    for (const a of m.actions) L.push(`| ${a.owner || '_unassigned_'} | ${a.text} | ${a.due || '—'} | ${a.t0 != null ? hhmm(a.t0) : '—'} |`);
+    for (const a of m.actions) L.push(`| ${a.owner || '_unassigned_'} | ${a.text}${flag(a, hhmm)} | ${a.due || '—'} | ${a.t0 != null ? hhmm(a.t0) : '—'} |`);
     L.push('');
   }
   if (m.open_questions?.length) { L.push('## Open questions', ''); for (const q of m.open_questions) L.push(`- ${q}`); L.push(''); }

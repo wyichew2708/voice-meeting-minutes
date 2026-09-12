@@ -5,11 +5,11 @@
  * step differently and the difference is visible in the code, because it is
  * visible to the user too (see asr.js).
  */
-import { AudioCapture, toWav, SAMPLE_RATE } from './audio.js';
-import { OnlineClusterer, SHIPPING, SPECTRAL_FALLBACK, SPECTRAL_RELIABLE_SPEAKERS } from './clustering.js';
+import { AudioCapture, toWav, flatten } from './audio.js';
+import { OnlineClusterer, SPEAKER_MODEL, SPECTRAL_FALLBACK, SPECTRAL_RELIABLE_SPEAKERS } from './clustering.js';
 import { Embedder } from './embed.js';
 import { makeASR, WebSpeechASR } from './asr.js';
-import { MinutesClient, toMarkdown, renderTranscript } from './minutes.js';
+import { MinutesClient, toMarkdown, renderTranscript, groundMinutes } from './minutes.js';
 import * as store from './store.js';
 
 const $ = (id) => document.getElementById(id);
@@ -20,6 +20,14 @@ const PALETTE = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899
 let settings = store.loadSettings();
 let capture = null, asr = null, clusterer = null, embedder = null;
 let session = null, segIndex = 0, pendingText = [], busy = false;
+
+// Whisper only: consecutive turns by the same speaker are transcribed as one
+// call. Whisper on a 1.5 s snippet is far worse than Whisper on 10 s of the
+// same voice, and a 0.7 s hangover cuts a turn at every breath. The run ends
+// on a change of speaker, COALESCE_GAP of silence, or COALESCE_MAX seconds —
+// the same ~1.2 s settle §1 describes for the final line.
+const COALESCE_GAP = 1.2, COALESCE_MAX = 20;
+let run = null, runTimer = null;
 
 /* ───────────────────────────────────────────────────────────── session ── */
 
@@ -67,10 +75,14 @@ async function start() {
 
   if (settings.embedBackend === 'onnx' && settings.embedOnnxUrl) {
     try {
-      const ort = await import('https://cdn.jsdelivr.net/npm/onnxruntime-web@1.20.1/dist/ort.webgpu.min.mjs');
+      // The wasm build, and this version: see ORT_GRAPH_OPT in embed.js.
+      const ORT = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/';
+      const ort = await import(`${ORT}ort.wasm.min.mjs`);
+      ort.env.wasm.wasmPaths = ORT;                 // else it looks for .wasm on this origin
+      setStatus('loading speaker model…');
       await embedder.useOnnx(settings.embedOnnxUrl, ort);
     } catch (e) {
-      warn(`Speaker model failed to load (${e.message}). Falling back to the approximate embedder.`);
+      warn(`Speaker model not loaded (${e.message.slice(0, 80)}). Run tools/fetch_models.py — using the approximate embedder, which is unreliable past 4 people.`);
     }
   }
   $('embedBadge').textContent = embedder.label;
@@ -78,7 +90,7 @@ async function start() {
   // The thresholds belong to the embedding geometry, not to the design, and
   // the two backends do not share one. Picking SHIPPING for the fallback
   // collapsed a four-person meeting into a single cluster when tested.
-  clusterer = new OnlineClusterer(embedder.backend === 'onnx' ? SHIPPING : SPECTRAL_FALLBACK);
+  clusterer = new OnlineClusterer(embedder.backend === 'onnx' ? SPEAKER_MODEL : SPECTRAL_FALLBACK);
 
   asr = makeASR(settings.asrEngine, {
     lang: settings.asrLang,
@@ -102,14 +114,25 @@ async function start() {
   asr.addEventListener('final', (e) => onWebSpeechFinal(e.detail));
   asr.addEventListener('asrerror', (e) => warn(`Recogniser: ${e.detail.message}`));
 
-  capture = new AudioCapture();
+  capture = new AudioCapture({ gate: settings.vadGate });
   capture.addEventListener('segment', (e) => onSegment(e.detail));
+  capture.addEventListener('gatefallback', (e) =>
+    warn(`Silero VAD did not load (${e.detail.reason.slice(0, 60)}) — using the energy gate; expect more false triggers.`));
+  capture.addEventListener("started", (e) => { $("gateBadge").hidden = false;
+    $('gateBadge').textContent = e.detail.gate === 'silero' ? 'Silero VAD' : 'energy gate';
+    $('gateBadge').classList.toggle('warn', e.detail.gate !== 'silero');
+  });
   capture.addEventListener('level', (e) => meter(e.detail));
   capture.addEventListener('speechstart', () => $('mic').classList.add('live'));
   capture.addEventListener('speechend', () => $('mic').classList.remove('live'));
 
   try { await capture.start(); } catch (e) {
-    fail(`Microphone: ${e.message}. The page must be on https or localhost.`); return;
+    const why = e.name === 'NotAllowedError' ? 'permission denied — allow the microphone for this page and press Start again'
+              : e.name === 'NotFoundError' ? 'no microphone found'
+              : e.name === 'NotReadableError' ? 'the microphone is in use by another app'
+              : !window.isSecureContext ? 'the page must be on https or localhost for the microphone to work'
+              : e.message;
+    fail(`Microphone: ${why}.`); return;
   }
   asr.start();
   setRunning(true);
@@ -127,6 +150,8 @@ async function end() {
   setStatus('finishing…');
   asr.stop();
   await capture.stop();
+  clearTimeout(runTimer);
+  await flushRun();
   clusterer.finish();
   // Deferral and re-clustering both rewrite assignments after the fact, so the
   // rendered transcript has to be rebuilt from the final map, not trusted as
@@ -165,13 +190,7 @@ async function onSegment(seg) {
   store.putClip(`${session.id}:${index}`, toWav(seg.pcm)).catch(() => {});
 
   if (settings.asrEngine === 'whisper') {
-    render();
-    try {
-      const text = await asr.transcribe(seg.pcm);
-      line.text = text || '';
-    } catch (e) { warn(`Transcription failed: ${e.message}`); }
-    if (!line.text) session.lines = session.lines.filter(l => l !== line);
-    render();
+    queueForWhisper(seg, line, cid);
   } else {
     // The browser recogniser is on its own clock. Text that already arrived is
     // claimed here; text that has not yet is claimed when it does.
@@ -179,6 +198,37 @@ async function onSegment(seg) {
     if (waiting) { line.text = waiting; }
     render();
   }
+}
+
+function queueForWhisper(seg, line, cid) {
+  clearTimeout(runTimer);
+  const joinable = run && cid !== null && run.clusterId === cid
+                && seg.start - run.end <= COALESCE_GAP
+                && run.seconds + seg.seconds <= COALESCE_MAX;
+  if (!joinable) flushRun();
+  if (!run) run = { pcms: [], t0: seg.start, end: seg.end, seconds: 0, clusterId: cid, lines: [] };
+  run.pcms.push(seg.pcm);
+  run.end = seg.end;
+  run.seconds += seg.seconds;
+  run.lines.push(line);
+  render();
+  runTimer = setTimeout(flushRun, COALESCE_GAP * 1000);
+}
+
+async function flushRun() {
+  if (!run) return;
+  const r = run; run = null;
+  let text = null;
+  try { text = await asr.transcribe(flatten(r.pcms), r.seconds); }
+  catch (e) { warn(`Transcription failed: ${e.message}`); }
+  // One transcript line for the run. The other segments still exist in the
+  // clusterer — they trained the centroid — they just do not get a row.
+  const head = r.lines[0];
+  head.seconds = r.seconds;
+  head.text = text || '';
+  const rest = new Set(r.lines.slice(1));
+  session.lines = session.lines.filter(l => !rest.has(l) && (l !== head || head.text));
+  render();
 }
 
 function onWebSpeechFinal({ text }) {
@@ -195,9 +245,12 @@ function render() {
   const atBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 80;
   box.innerHTML = '';
   for (const l of session.lines) {
-    if (!l.text) continue;
+    // Whisper: a turn that is cut but not yet transcribed shows as a pending
+    // row in the speaker's colour, so the page visibly heard them.
+    const pending = !l.text && settings.asrEngine === 'whisper' && capture;
+    if (!l.text && !pending) continue;
     const row = document.createElement('div');
-    row.className = 'line';
+    row.className = 'line' + (pending ? ' pending' : '');
     const cid = l.clusterId;
     const tag = document.createElement('button');
     tag.className = 'who';
@@ -209,7 +262,7 @@ function render() {
     t.className = 'at'; t.textContent = hhmm(l.t0);
     t.onclick = () => playClip(l.index);
     const txt = document.createElement('span');
-    txt.className = 'text'; txt.textContent = l.text;
+    txt.className = 'text'; txt.textContent = pending ? '…' : l.text;
     row.append(t, tag, txt);
     box.appendChild(row);
   }
@@ -307,10 +360,13 @@ async function generate() {
       durationSeconds: Math.round(session.durationSeconds),
       attendees: attendees().map(({ name, speaking_seconds }) => ({ name, speaking_seconds })),
     }, { onStage: (s) => setStatus(`minutes · ${s}`) });
-    session.minutes = m;
-    renderMinutes(m);
+    session.minutes = groundMinutes(m, lines);
+    renderMinutes(session.minutes);
     await store.saveSession(session);
-    setStatus('minutes ready — check them before circulating');
+    const g = session.minutes._grounding;
+    const flagged = g.weak + g.unsourced;
+    if (flagged) warn(`minutes ready — ${flagged} of ${g.total} items could not be verified against the transcript, check those first`);
+    else setStatus(`minutes ready — all ${g.total} decisions and actions verified against the transcript`);
   } catch (e) {
     fail(`Minutes failed: ${e.message}`);
   } finally { busy = false; $('generate').disabled = false; }
@@ -341,7 +397,7 @@ function openConsent() { $('consent').showModal(); }
 
 function bindSettings() {
   const map = {
-    asrEngine: 'asrEngine', asrLang: 'asrLang', whisperModel: 'whisperModel',
+    asrEngine: 'asrEngine', asrLang: 'asrLang', vadGate: 'vadGate', whisperModel: 'whisperModel',
     whisperDtype: 'whisperDtype', whisperDevice: 'whisperDevice',
     embedBackend: 'embedBackend', embedOnnxUrl: 'embedOnnxUrl',
     llmBaseUrl: 'llmBaseUrl', llmApiKey: 'llmApiKey', llmModel: 'llmModel', llmFormat: 'llmFormat',
@@ -402,7 +458,8 @@ const fail = (t) => { $('status').textContent = t; $('status').className = 'stat
 
 function reflectEmbedder() {
   const onnx = settings.embedBackend === 'onnx' && settings.embedOnnxUrl;
-  $('embedBadge').textContent = onnx ? 'ECAPA-TDNN (ONNX)' : 'spectral fallback — approximate';
+  const name = onnx ? settings.embedOnnxUrl.split('/').pop().replace(/\.onnx$/, '') : '';
+  $('embedBadge').textContent = onnx ? `${name} (ONNX)` : 'spectral fallback — approximate';
   $('embedBadge').classList.toggle('warn', !onnx);
 }
 

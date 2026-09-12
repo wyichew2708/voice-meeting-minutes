@@ -46,3 +46,24 @@ the first draft of the design was outside the working range entirely.
 | `load.py` | ASR requests and audio-seconds, prompt timing, transcript volume, minutes tokens, shared-endpoint capacity |
 | `window_scan.py` | The band of thresholds that works, against meeting size |
 | `test_scale.py` | Asserts every claim in `docs/scale-test.md` |
+
+## The browser build's checks
+
+The same habit, applied to [`../web/`](../web/). Each is a plain `node` script
+with no dependencies beyond the file it checks; the last two need Python and a
+Mac. Full write-up in [`../docs/html-version.md`](../docs/html-version.md).
+
+| | |
+|---|---|
+| `verify_js_port.mjs` | The JS clusterer reproduces the claims above, 2 to 12 people |
+| `verify_fbank.mjs` | `web/js/fbank.js` is Kaldi fbank, frame for frame against torchaudio |
+| `verify_trim.mjs` | Segment windows end at the last word, not at the gate's hangover |
+| `verify_hallucination_filter.mjs` | Whisper's subtitle hallucinations dropped, backchannels kept |
+| `verify_grounding.mjs` | Minutes items flagged against the transcript for the right reasons |
+| `make_tts_corpus.sh` | Twelve TTS voices, eight utterances each — real speech for the speaker model (macOS `say`) |
+| `campp_reference.py` | CAM++ through the reference pipeline: geometry, CMN, the threshold scan, who merges with whom; writes the browser check's reference |
+
+⚠ The TTS corpus is real speech through a real speaker model, which the
+synthetic geometry above is not — and it is still twelve close-talk synthetic
+voices, not ten colleagues around a table mic. It found a real limit (two
+near-identical voices merge) and it does not promise the room.

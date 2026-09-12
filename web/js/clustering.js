@@ -57,6 +57,39 @@ export const SPECTRAL_FALLBACK = {
   reclusterThreshold: 0.95,
 };
 
+/* Calibrated for the CAM++ speaker model (wespeaker_en_voxceleb_CAM++), the
+ * ONNX backend's default. Measured through the reference pipeline —
+ * torchaudio Kaldi fbank + sim/clustering.py — on 12 TTS voices, 96
+ * utterances, per-utterance mean subtraction:
+ *
+ *     within-speaker  mean 0.744   p05 0.434   short clips (<2 s) 0.589
+ *     between-speaker mean 0.166   p95 0.401   max 0.770
+ *
+ * A wider gap than the ECAPA geometry SHIPPING assumes (0.72 / 0.32), so the
+ * design's thresholds nearly fit, and a scan over real embeddings moved two:
+ *
+ *     threshold 0.60 -> 0.65   10 people: 8.9 -> 9.5 clusters, 10.4% -> 5.8%
+ *     recluster 0.72 -> 0.80   the 0.72 pass was merging the closest pair
+ *
+ * The confusion that remains is ONE pair, in six seeds of eight: two Indian-
+ * English male voices at centroid cosine 0.723. No threshold under 0.72 separates
+ * them and anything over it splits the same person (within p05 0.43). With
+ * either of them out of the room, ten people cluster exactly. This is §4.6 —
+ * two people who genuinely sound alike are merged — measured rather than
+ * predicted, and the reason manual split is in P1 rather than deferred.
+ *
+ * ⚠ TTS voices, close-talk, no room. Real far-field audio will be worse and
+ *   these are starting values to tune on recordings of the actual room.
+ */
+export const SPEAKER_MODEL = {
+  threshold: 0.65,
+  minCentroidSeconds: 1.5,
+  margin: 0.06,
+  deferUnderSeconds: 1.5,
+  reclusterEvery: 100,
+  reclusterThreshold: 0.80,
+};
+
 /** Speakers above which the built-in embedder should not be trusted. */
 export const SPECTRAL_RELIABLE_SPEAKERS = 4;
 

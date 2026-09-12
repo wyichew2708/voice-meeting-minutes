@@ -3,3 +3,6 @@ __pycache__/
 
 # Converted model weights — hundreds of MB, rebuilt with tools/export_singlish_onnx.py
 web/models/
+
+# TTS test corpus — regenerate with sim/make_tts_corpus.sh (macOS)
+sim/corpus/

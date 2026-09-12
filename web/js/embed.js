@@ -9,9 +9,16 @@
  *
  * Two backends:
  *
- *   'onnx'     — a real ECAPA-TDNN via onnxruntime-web. This is the one the
- *                design specifies and the thresholds are calibrated for. It
- *                needs a model file; see tools/README.md.
+ *   'onnx'     — a real speaker-verification model via onnxruntime-web:
+ *                CAM++ from sherpa-onnx by default (tools/fetch_models.py).
+ *                Kaldi fbank in (fbank.js, verified against torchaudio),
+ *                per-utterance mean subtraction, 512-d embedding out.
+ *
+ *                Measured on 12 TTS voices through the reference pipeline:
+ *                with CMN, within-speaker 0.744 / between 0.166 — a wider
+ *                gap than the ECAPA numbers the design assumed. WITHOUT CMN
+ *                the same model gives between 0.506 and ten people collapse
+ *                into 2.5 clusters. The subtraction is not optional.
  *
  *   'spectral' — a dependency-free fallback: long-term log-mel statistics.
  *                It captures gross vocal-tract timbre and will separate two
@@ -26,41 +33,30 @@
  */
 import { SAMPLE_RATE } from './audio.js';
 import { normalise } from './clustering.js';
+import { kaldiFbank, subtractMean, fft } from './fbank.js';
 
 const N_FFT = 512, HOP = 160, N_MELS = 40;
+
+/* ⚠ The onnxruntime-web pin matters for this model. On 1.22.0 (wasm) the
+ * graph optimiser returns deterministic but WRONG embeddings at every level
+ * but 'disabled' — cosine to the Python reference 0.17 for a 4.1 s clip,
+ * 0.04 for 4.7 s, 0.9997 for 8.0 s, the same wrong answer every time. The
+ * fbank into it matches torchaudio to 5e-3, so it is the optimiser. On
+ * 1.29.0 every level matches to 1.0000 at the same speed (118-136 ms per
+ * 4-5 s clip, wasm, one thread). So: 1.29.0, optimiser on. Do not lower the
+ * pin in app.js / audio.js without re-running the in-browser check described
+ * in docs/html-version.md — the failure is silent and the labels look fine.
+ *
+ * WebGPU is not used. The 1.22.0 JSEP build threw an Emscripten exception
+ * creating a session for this model even with a Metal adapter, and wasm is
+ * already comfortably real-time, so it was not worth a second dependency. */
+export const ORT_GRAPH_OPT = 'all';
 
 const hann = (() => {
   const w = new Float32Array(N_FFT);
   for (let i = 0; i < N_FFT; i++) w[i] = 0.5 - 0.5 * Math.cos(2 * Math.PI * i / (N_FFT - 1));
   return w;
 })();
-
-/** Iterative radix-2 FFT, in place, real+imag split. */
-function fft(re, im) {
-  const n = re.length;
-  for (let i = 1, j = 0; i < n; i++) {
-    let bit = n >> 1;
-    for (; j & bit; bit >>= 1) j ^= bit;
-    j ^= bit;
-    if (i < j) { [re[i], re[j]] = [re[j], re[i]]; [im[i], im[j]] = [im[j], im[i]]; }
-  }
-  for (let len = 2; len <= n; len <<= 1) {
-    const ang = -2 * Math.PI / len;
-    const wr = Math.cos(ang), wi = Math.sin(ang);
-    for (let i = 0; i < n; i += len) {
-      let cr = 1, ci = 0;
-      for (let k = 0; k < len / 2; k++) {
-        const ur = re[i + k], ui = im[i + k];
-        const vr = re[i + k + len / 2] * cr - im[i + k + len / 2] * ci;
-        const vi = re[i + k + len / 2] * ci + im[i + k + len / 2] * cr;
-        re[i + k] = ur + vr; im[i + k] = ui + vi;
-        re[i + k + len / 2] = ur - vr; im[i + k + len / 2] = ui - vi;
-        const ncr = cr * wr - ci * wi;
-        ci = cr * wi + ci * wr; cr = ncr;
-      }
-    }
-  }
-}
 
 const hz2mel = (f) => 2595 * Math.log10(1 + f / 700);
 const mel2hz = (m) => 700 * (10 ** (m / 2595) - 1);
@@ -194,16 +190,21 @@ export class Embedder {
 
   get label() {
     return this.backend === 'onnx'
-      ? 'ECAPA-TDNN (ONNX)'
+      ? `${this.modelName || 'speaker model'} (ONNX)`
       : 'spectral fallback — approximate';
   }
 
-  /** Load a real ECAPA-TDNN. `url` points at an .onnx exported per tools/README.md. */
+  /** Load a sherpa-onnx speaker model. `url` is served from web/models/;
+   *  `ortModule` must be the wasm build (see ORT_GRAPH_OPT above). */
   async useOnnx(url, ortModule) {
     this.ort = ortModule;
     this.session = await ortModule.InferenceSession.create(url, {
-      executionProviders: ['webgpu', 'wasm'],
+      executionProviders: ['wasm'],
+      graphOptimizationLevel: ORT_GRAPH_OPT,
     });
+    this.modelName = url.split('/').pop().replace(/\.onnx$/, '');
+    this.inputName = this.session.inputNames[0];    // 'feats'
+    this.outputName = this.session.outputNames[0];  // 'embs'
     this.backend = 'onnx';
   }
 
@@ -211,11 +212,11 @@ export class Embedder {
 
   async embed(pcm) {
     if (this.backend === 'onnx' && this.session) {
-      const name = this.session.inputNames[0];
-      const t = new this.ort.Tensor('float32', pcm, [1, pcm.length]);
-      const out = await this.session.run({ [name]: t });
-      const v = out[this.session.outputNames[0]].data;
-      return normalise(Float32Array.from(v));
+      const fb = subtractMean(kaldiFbank(pcm));
+      if (fb.frames < 10) return normalise(new Float32Array(512).fill(1e-6)); // < 0.1 s: nothing to embed
+      const t = new this.ort.Tensor('float32', fb.data, [1, fb.frames, 80]);
+      const out = await this.session.run({ [this.inputName]: t });
+      return normalise(Float32Array.from(out[this.outputName].data));
     }
     return this._centre(spectralEmbedding(pcm));
   }

@@ -1,6 +1,7 @@
 # web — the browser-only version
 
 ```
+python3 tools/fetch_models.py          # once: the 29 MB speaker model
 cd web && python3 -m http.server 8791
 ```
 
@@ -19,19 +20,23 @@ and where its speaker identification breaks: [`../docs/html-version.md`](../docs
 2. **Settings → Speech recognition.** The browser recogniser needs no setup but
    sends audio to Google. Whisper-Singlish is local; convert it first with
    `python3 ../tools/export_singlish_onnx.py`.
-3. **Settings → Speaker identification.** The built-in embedder needs nothing
-   and is fine up to about four voices. Past that, convert an ECAPA-TDNN to
-   ONNX and point at it.
+3. **Settings → Speaker identification.** CAM++ is the default and is what the
+   ten-person figures were measured with; `fetch_models.py` above is all it
+   needs. Without it the app falls back to a built-in embedder that is fine to
+   about four voices and says so.
+4. **Settings → Speech gate.** Silero VAD by default, from the CDN. The energy
+   gate is the offline fallback.
 
 ## Files
 
 | | |
 |---|---|
-| `js/audio.js` | Mic capture, the speech gate, turn segmentation, the rolling embedding window |
-| `js/asr.js` | The two recognisers, and the trade-off between them |
-| `js/embed.js` | Speaker embeddings — ECAPA via ONNX, or the MFCC fallback |
-| `js/clustering.js` | `sim/clustering.py` ported, guards intact, plus the fallback's own calibration |
-| `js/minutes.js` | The configurable API client, §6's schema and prompts |
+| `js/audio.js` | Mic capture, Silero VAD / energy gate, turn segmentation, windows aligned to the last word |
+| `js/asr.js` | The two recognisers, the trade-off between them, the Whisper hallucination filter |
+| `js/fbank.js` | Kaldi fbank in JS, verified against torchaudio |
+| `js/embed.js` | Speaker embeddings — CAM++ via onnxruntime-web, or the MFCC fallback |
+| `js/clustering.js` | `sim/clustering.py` ported, guards intact; configs measured for CAM++ and for the fallback |
+| `js/minutes.js` | The configurable API client, §6's schema and prompts, the grounding check |
 | `js/store.js` | IndexedDB — sessions, audio clips, voiceprints |
 | `js/app.js` | Session orchestration: the gateway's job, in the page |
 

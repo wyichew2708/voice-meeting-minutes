@@ -13,6 +13,7 @@
     <span id="mic" class="mic" aria-hidden="true"></span>
     <h1>Voice Meeting Minutes</h1>
     <span id="embedBadge" class="badge"></span>
+    <span id="gateBadge" class="badge" hidden></span>
   </div>
   <div class="controls">
     <button id="start" class="primary">Start</button>
@@ -79,6 +80,15 @@
   </label>
   <p id="privacyNote" class="note"></p>
 
+  <label>Speech gate
+    <select id="vadGate">
+      <option value="silero">Silero VAD — neural, 2 MB, downloaded once</option>
+      <option value="energy">Energy gate — no download, more false triggers</option>
+    </select>
+  </label>
+  <p class="note">Decides when someone is talking. The energy gate opens for air-con, keyboards
+     and breathing; each false open is a clip the recogniser can invent words for.</p>
+
   <div id="webspeechRow">
     <label>Language
       <select id="asrLang">
@@ -126,18 +136,27 @@
   <h3>Speaker identification</h3>
   <label>Embedder
     <select id="embedBackend">
-      <option value="spectral">Built-in approximate — nothing to download</option>
-      <option value="onnx">ECAPA-TDNN (ONNX) — as the design specifies</option>
+      <option value="onnx">Speaker model (ONNX) — CAM++, real speaker verification</option>
+      <option value="spectral">Built-in approximate — nothing to download, ≤4 people</option>
     </select>
   </label>
   <div id="onnxRow" hidden>
-    <label>Model URL
-      <input id="embedOnnxUrl" type="url" placeholder="models/ecapa.onnx" spellcheck="false">
+    <label>Model
+      <input id="embedOnnxUrl" type="text" list="embedModels"
+             placeholder="models/wespeaker_en_voxceleb_CAM++.onnx" spellcheck="false">
+      <datalist id="embedModels">
+        <option value="models/wespeaker_en_voxceleb_CAM++.onnx">CAM++ English — default, 29 MB</option>
+        <option value="models/3dspeaker_speech_campplus_sv_zh_en_16k-common_advanced.onnx">CAM++ Chinese + English, 28 MB</option>
+        <option value="models/wespeaker_en_voxceleb_resnet34_LM.onnx">ResNet34 English, 27 MB</option>
+        <option value="models/3dspeaker_speech_eres2net_sv_en_voxceleb_16k.onnx">ERes2Net English, 27 MB</option>
+      </datalist>
     </label>
+    <p class="note">Fetch with <code>python3 tools/fetch_models.py</code>. If the file is
+       missing the app falls back to the built-in embedder and says so.</p>
   </div>
-  <p class="note warn">The clustering thresholds are calibrated for ECAPA's geometry.
-     The built-in embedder separates clearly different voices but is not a
-     speaker-verification model — expect to rename people by hand.</p>
+  <p class="note warn">The built-in embedder separates clearly different voices but is not a
+     speaker-verification model, and past four people it mislabels a lot. The
+     ONNX model is what the ten-person figures were measured with.</p>
 
   <h3>Minutes API</h3>
   <label>Base URL
