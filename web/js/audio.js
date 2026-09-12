@@ -15,23 +15,32 @@
  *              when the CDN is unreachable, and the gate the design's numbers
  *              were first written against.
  *
- * Two windows, deliberately not shared (this is the sim/windowed.py finding):
- *   - the ASR window is the turn: silence to silence, what a person just said.
- *   - the embedding window is a rolling EMBED_WINDOW seconds ending at the cut,
- *     so an interrupt-heavy meeting still gives the embedder enough voice to
- *     work with. Sharing one window collapsed to 104 clusters for 10 people.
+ * One window: the turn, silence to silence. Both the recogniser and the
+ * speaker embedder get the same clip.
  *
- * "Ending at the cut" needs care. Every hangover-based gate decides a turn is
- * over some time *after* the last word — measured at ~1.3 s for Silero with
- * these settings, 0.7 s for the energy gate — so the audio it hands back ends
- * in silence, and a rolling window taken at that moment is silence-padded.
- * For a 2 s turn that is a window that is more silence than speaker. So the
- * clip's trailing silence is measured and both windows are aligned to the
- * last audible sample, not to the moment the gate noticed.
+ * That reverses sim/windowed.py, which embedded on a rolling 4 s window ending
+ * at the cut so that one speaker chopped into 2 s pieces still gave the
+ * embedder enough voice. Measured with CAM++ on real speech in meeting-shaped
+ * conversations, the window is a net loss: it reaches back into the PREVIOUS
+ * speaker's turn, and 61-75% of short replies then embed nearer to whoever
+ * spoke before. Segment-only against the rolling window, 6-minute
+ * conversations, 5 seeds:
+ *
+ *      4 people   4.0 clusters 0.0%     vs   4.6 clusters 2.6%
+ *      8 people   7.8 clusters 0.1%     vs   8.8 clusters 2.2%
+ *     10 people   8.8 clusters 8.2%     vs  10.6 clusters 9.9%
+ *
+ * The case the window protected against is covered another way: Silero's
+ * hangover does not cut a turn at a breath, and the clusterer's guards keep
+ * segments under 1.5 s out of the centroids and defer them to the end.
+ *
+ * Every hangover gate decides a turn is over some time *after* the last word
+ * — measured at ~1.3 s for Silero with these settings — so the audio it hands
+ * back ends in silence. The clip is trimmed to its last audible sample; the
+ * recogniser gets 0.2 s of that silence back because it likes a clean end.
  */
 
 export const SAMPLE_RATE = 16000;
-export const EMBED_WINDOW = 4.0;   // sim/windowed.py
 const PRE_ROLL = 0.25;             // audio kept from before the gate opened
 const HANGOVER = 0.70;             // silence that ends a turn (design §5)
 const MIN_TURN = 0.35;             // shorter than this is not a turn
@@ -50,31 +59,6 @@ class Pump extends AudioWorkletProcessor {
 }
 registerProcessor('pump', Pump);
 `;
-
-/** Rolling PCM buffer holding the last `seconds` of audio. */
-class Ring {
-  constructor(seconds, rate = SAMPLE_RATE) {
-    this.buf = new Float32Array(Math.ceil(seconds * rate));
-    this.w = 0;
-    this.filled = false;
-  }
-  push(frame) {
-    for (let i = 0; i < frame.length; i++) {
-      this.buf[this.w] = frame[i];
-      this.w = (this.w + 1) % this.buf.length;
-      if (this.w === 0) this.filled = true;
-    }
-  }
-  /** The most recent `seconds`, oldest sample first. */
-  tail(seconds, rate = SAMPLE_RATE) {
-    const want = Math.min(Math.ceil(seconds * rate), this.filled ? this.buf.length : this.w);
-    const out = new Float32Array(want);
-    for (let i = 0; i < want; i++) {
-      out[want - 1 - i] = this.buf[(this.w - 1 - i + this.buf.length * 2) % this.buf.length];
-    }
-    return out;
-  }
-}
 
 const rms = (f) => { let s = 0; for (let i = 0; i < f.length; i++) s += f[i] * f[i]; return Math.sqrt(s / f.length); };
 
@@ -98,15 +82,19 @@ export function trailingSpeechEnd(pcm, { chunk = 320, rel = 0.06, abs = 0.0015 }
 const scriptOnce = (src) => new Promise((res, rej) => {
   if ([...document.scripts].some(s => s.src === src)) return res();
   const el = document.createElement('script');
+  el.crossOrigin = 'anonymous';           // allowed under a cross-origin-isolated page (tools/serve.py --isolate)
   el.src = src; el.onload = res; el.onerror = () => rej(new Error(`could not load ${src}`));
   document.head.appendChild(el);
 });
 
 export class AudioCapture extends EventTarget {
-  constructor({ embedWindow = EMBED_WINDOW, gate = 'silero' } = {}) {
+  constructor({ gate = 'silero', stream = null, processing = false } = {}) {
     super();
-    this.embedWindow = embedWindow;
     this.gateWanted = gate;
+    this.injected = stream;         // a MediaStream to use instead of the microphone (self-test, tab audio)
+    this.processing = processing;
+    this.startedAt = 0;             // performance.now() when audio began flowing — the recogniser's clock is wall time
+    this.trackSettings = {};
     this.gate = null;               // what actually started
     this.ctx = null;
     this.stream = null;
@@ -116,7 +104,6 @@ export class AudioCapture extends EventTarget {
 
     this.speaking = false;
     this.t = 0;                     // seconds of audio seen
-    this.ring = new Ring(Math.max(embedWindow, 6) + 1);
 
     // energy-gate state
     this.floor = 0.005;
@@ -128,10 +115,17 @@ export class AudioCapture extends EventTarget {
 
   async start() {
     if (this.running) return;
-    this.stream = await navigator.mediaDevices.getUserMedia({
+    // Browser audio processing is built for calls, not for telling voices
+    // apart: noise suppression reshapes the spectrum a speaker model reads,
+    // auto gain hides the level differences between people, and there is no
+    // far end here for echo cancellation to cancel. Off unless asked for.
+    this.stream = this.injected ?? await navigator.mediaDevices.getUserMedia({
       audio: { channelCount: 1, sampleRate: SAMPLE_RATE,
-               echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+               echoCancellation: this.processing, noiseSuppression: this.processing,
+               autoGainControl: this.processing },
     });
+    const track = this.stream.getAudioTracks()[0];
+    this.trackSettings = track?.getSettings?.() ?? {};
 
     if (this.gateWanted === 'silero') {
       try { await this._startSilero(); }
@@ -143,6 +137,7 @@ export class AudioCapture extends EventTarget {
       await this._startEnergy();
     }
     this.running = true;
+    this.startedAt = performance.now();
     this.dispatchEvent(new CustomEvent('started', { detail: { gate: this.gate } }));
   }
 
@@ -168,7 +163,6 @@ export class AudioCapture extends EventTarget {
       onFrameProcessed: (probs, frame) => {
         if (!frame) return;
         this.t += frame.length / SAMPLE_RATE;
-        this.ring.push(frame);
         this.dispatchEvent(new CustomEvent('level', {
           detail: { level: rms(frame), speech: probs.isSpeech >= 0.5 },
         }));
@@ -220,7 +214,6 @@ export class AudioCapture extends EventTarget {
     if (!this.running || this.paused) return;
     const dt = frame.length / SAMPLE_RATE;
     this.t += dt;
-    this.ring.push(frame);
 
     const level = rms(frame);
     // Track the floor downward fast and upward slowly: a door slamming should
@@ -273,17 +266,13 @@ export class AudioCapture extends EventTarget {
     const speechEnd = trailingSpeechEnd(raw);
     const seconds = speechEnd / SAMPLE_RATE;
     if (seconds < MIN_TURN) return;                 // a cough, not a turn
-    const lag = raw.length - speechEnd;             // samples the gate took to notice
-    // The embedding window ends at the last word, not at the cut: take a
-    // window that reaches back far enough, then drop the gate's lag off it.
-    const win = this.ring.tail(this.embedWindow + lag / SAMPLE_RATE);
-    const embedPcm = win.subarray(0, Math.max(0, win.length - lag));
     this.dispatchEvent(new CustomEvent('segment', {
       detail: {
         // The turn plus 0.2 s of its own silence: Whisper does better with a
         // clean end than with a word cut at the sample.
         pcm: raw.subarray(0, Math.min(raw.length, speechEnd + 0.2 * SAMPLE_RATE)),
-        embedPcm,
+        // The turn alone, for the embedder — see the header for why not more.
+        embedPcm: raw.subarray(0, speechEnd),
         seconds,
         start,
         end: start + seconds,

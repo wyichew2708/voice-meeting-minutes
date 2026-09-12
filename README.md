@@ -10,9 +10,11 @@ The design below targets the RHEL GPU box and is still the plan of record.
 A second, self-contained version runs entirely in the browser — no gateway, no
 GPU box, an LLM API you supply — and is the fastest way to actually use this:
 **[`web/`](web/)**, written up in **[docs/html-version.md](docs/html-version.md)**.
-It trades MERaLiON for a Singlish Whisper finetune, and identifies ten people
-with a real speaker model (CAM++, one script away) — with the one limit §4.6
-predicts, two near-identical voices merging, measured rather than assumed.
+It trades MERaLiON for a Singlish Whisper finetune — 18.5% WER measured on real
+spontaneous Singlish through the same pipeline — and identifies ten people with
+a real speaker model (CAM++, one script away), with the one limit §4.6 predicts,
+two near-identical voices merging, measured rather than assumed. A self-test
+page checks all of it in your own browser and room.
 
 - **[docs/solution-design.md](docs/solution-design.md)** — architecture, models, speaker
   identification, minutes generation, deployment, risks, delivery plan

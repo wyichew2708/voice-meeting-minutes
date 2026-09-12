@@ -2,12 +2,15 @@
 
 ```
 python3 tools/fetch_models.py          # once: the 29 MB speaker model
-cd web && python3 -m http.server 8791
+python3 tools/export_singlish_onnx.py  # once, optional: local Singlish Whisper (~1 GB download)
+python3 tools/serve.py                 # http://localhost:8791
 ```
 
-Then <http://localhost:8791>. A static server is required (ES modules do not
-load over `file://`); `localhost` is a secure context, so the microphone works
-without TLS.
+Then open <http://localhost:8791/selftest.html> first — it checks the pipeline
+in your browser against the reference, then your microphone and room — and
+<http://localhost:8791> for the app. `serve.py` is `http.server` with caching
+off and the page cross-origin isolated (four wasm threads for Whisper);
+`localhost` is a secure context, so the microphone works without TLS.
 
 Full write-up, including what this version gives up against the server design
 and where its speaker identification breaks: [`../docs/html-version.md`](../docs/html-version.md).
@@ -18,14 +21,20 @@ and where its speaker identification breaks: [`../docs/html-version.md`](../docs
    OpenAI `/v1/chat/completions` shape works; Anthropic `/v1/messages` is also
    supported. *Test connection* checks it before a meeting rather than during.
 2. **Settings → Speech recognition.** The browser recogniser needs no setup but
-   sends audio to Google. Whisper-Singlish is local; convert it first with
-   `python3 ../tools/export_singlish_onnx.py`.
+   sends audio to Google. Whisper-Singlish is local and understands Singlish
+   (19% WER on real spontaneous speech, against 148% for vanilla Whisper);
+   export it once with `python3 tools/export_singlish_onnx.py`. On WebGPU it
+   runs ten times faster than live; on wasm about four times, on the isolated
+   server.
 3. **Settings → Speaker identification.** CAM++ is the default and is what the
    ten-person figures were measured with; `fetch_models.py` above is all it
    needs. Without it the app falls back to a built-in embedder that is fine to
    about four voices and says so.
 4. **Settings → Speech gate.** Silero VAD by default, from the CDN. The energy
-   gate is the offline fallback.
+   gate is the offline fallback. Browser audio processing is off by default;
+   it is built for calls and hurts speaker labels.
+5. **Speakers: auto ▾** in the header. If you know how many people are in the
+   room, say so — the clustering is redone to that count, now and at End.
 
 ## Files
 

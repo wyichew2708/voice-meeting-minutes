@@ -116,15 +116,15 @@ export class OnlineClusterer {
 
   _similarities(emb) { return this.clusters.map(c => dot(emb, c.centroid)); }
 
-  _newCluster(emb, seconds) {
+  _newCluster(emb, seconds, index = -1) {
     const c = { id: this._next++, centroid: new Float32Array(emb), seconds, n: 1,
-                bank: [{ emb, seconds }] };
+                bank: [{ index, emb, seconds }] };
     this.clusters.push(c);
     return c;
   }
 
-  _absorb(c, emb, seconds) {
-    c.bank.push({ emb, seconds });
+  _absorb(c, emb, seconds, index = -1) {
+    c.bank.push({ index, emb, seconds });
     c.n += 1;
     c.seconds += seconds;
     // Short segments are assigned but never learned from: their embeddings are
@@ -147,7 +147,7 @@ export class OnlineClusterer {
 
     const sims = this._similarities(emb);
     if (!sims.length) {
-      const c = this._newCluster(emb, seconds);
+      const c = this._newCluster(emb, seconds, index);
       this.assignment.set(index, c.id);
       this._tick();
       return c.id;
@@ -164,8 +164,8 @@ export class OnlineClusterer {
     if (ok && cfg.margin && (sims[best] - runner) < cfg.margin) ok = false;
 
     let cid;
-    if (ok) { this._absorb(this.clusters[best], emb, seconds); cid = this.clusters[best].id; }
-    else { cid = this._newCluster(emb, seconds).id; }
+    if (ok) { this._absorb(this.clusters[best], emb, seconds, index); cid = this.clusters[best].id; }
+    else { cid = this._newCluster(emb, seconds, index).id; }
     this.assignment.set(index, cid);
     this._tick();
     return cid;
@@ -212,9 +212,12 @@ export class OnlineClusterer {
     return merges;
   }
 
-  _recentre(c) {
-    const long = c.bank.filter(x => x.seconds >= this.cfg.minCentroidSeconds);
-    const use = long.length ? long : c.bank;
+  _recentre(c) { c.centroid = this._meanOf(c.bank); }
+
+  /** Duration-weighted mean of a bank, over its long segments when it has any. */
+  _meanOf(bank) {
+    const long = bank.filter(x => x.seconds >= this.cfg.minCentroidSeconds);
+    const use = long.length ? long : bank;
     const dim = use[0].emb.length;
     const m = new Float32Array(dim);
     let wsum = 0;
@@ -223,7 +226,7 @@ export class OnlineClusterer {
       for (let i = 0; i < dim; i++) m[i] += emb[i] * seconds;
     }
     for (let i = 0; i < dim; i++) m[i] /= (wsum || 1e-9);
-    c.centroid = normalise(m);
+    return normalise(m);
   }
 
   /** Place every held-back segment against the finished centroids.
@@ -235,17 +238,119 @@ export class OnlineClusterer {
   resolveDeferred() {
     for (const { index, emb, seconds } of this.deferred) {
       if (!this.clusters.length) {
-        this.assignment.set(index, this._newCluster(emb, seconds).id);
+        this.assignment.set(index, this._newCluster(emb, seconds, index).id);
         continue;
       }
       const sims = this._similarities(emb);
       let best = 0;
       for (let i = 1; i < sims.length; i++) if (sims[i] > sims[best]) best = i;
-      this.clusters[best].n += 1;
-      this.clusters[best].seconds += seconds;
-      this.assignment.set(index, this.clusters[best].id);
+      const c = this.clusters[best];
+      c.n += 1;
+      c.seconds += seconds;
+      c.bank.push({ index, emb, seconds });   // banked, so a re-cluster can move it; too short to recentre on
+      this.assignment.set(index, c.id);
     }
     this.deferred.length = 0;
+  }
+
+  /* ─────────────────────────────────────────── known headcount ── */
+
+  /** Re-cluster to exactly `n` speakers, for when the user knows how many
+   *  people are in the room.
+   *
+   *  Thresholds are a guess about a room the model has never heard; a
+   *  headcount is a fact. Merge the closest pair while there are too many,
+   *  split the least coherent cluster in two while there are too few, then
+   *  give every banked segment — deferred ones included — its nearest
+   *  centroid. Banked embeddings make this instant, so it works mid-meeting
+   *  and again at End. Returns how many segments changed label. */
+  reclusterTo(n) {
+    if (!n || n < 1 || !this.clusters.length) return 0;
+    const before = new Map(this.assignment);
+    this.resolveDeferred();
+    while (this.clusters.length > n && this._mergeClosest()) { /* merge */ }
+    while (this.clusters.length < n && this._splitWidest()) { /* split */ }
+    const all = this.clusters.flatMap(c => c.bank);
+    for (const c of this.clusters) { c.bank = []; c.n = 0; c.seconds = 0; }
+    for (const s of all) {
+      const sims = this._similarities(s.emb);
+      let b = 0;
+      for (let i = 1; i < sims.length; i++) if (sims[i] > sims[b]) b = i;
+      const c = this.clusters[b];
+      c.bank.push(s); c.n += 1; c.seconds += s.seconds;
+      this.assignment.set(s.index, c.id);
+    }
+    this.clusters = this.clusters.filter(c => c.bank.length);
+    for (const c of this.clusters) this._recentre(c);
+    let changed = 0;
+    for (const [k, v] of this.assignment) if (before.get(k) !== v) changed++;
+    return changed;
+  }
+
+  _mergeClosest() {
+    let best = -Infinity, pair = null;
+    for (let i = 0; i < this.clusters.length; i++) {
+      for (let j = i + 1; j < this.clusters.length; j++) {
+        const s = dot(this.clusters[i].centroid, this.clusters[j].centroid);
+        if (s > best) { best = s; pair = [i, j]; }
+      }
+    }
+    if (!pair) return false;
+    const a = this.clusters[pair[0]], b = this.clusters[pair[1]];
+    const [keep, drop] = a.seconds >= b.seconds ? [a, b] : [b, a];
+    keep.bank.push(...drop.bank);
+    keep.seconds += drop.seconds;
+    keep.n += drop.n;
+    this._recentre(keep);
+    for (const [k, v] of this.assignment) if (v === drop.id) this.assignment.set(k, keep.id);
+    this.clusters.splice(this.clusters.indexOf(drop), 1);
+    return true;
+  }
+
+  /** Split the cluster whose long segments agree least with its centroid,
+   *  by 2-means on cosine seeded from its two most distant members. */
+  _splitWidest() {
+    let target = null, worst = Infinity;
+    for (const c of this.clusters) {
+      const long = c.bank.filter(x => x.seconds >= this.cfg.minCentroidSeconds);
+      if (long.length < 4) continue;
+      const agree = long.reduce((a, x) => a + dot(x.emb, c.centroid), 0) / long.length;
+      if (agree < worst) { worst = agree; target = c; }
+    }
+    if (!target) return false;
+    const pts = target.bank.filter(x => x.seconds >= this.cfg.minCentroidSeconds);
+    let ia = 0, ib = 1, far = Infinity;
+    for (let i = 0; i < pts.length; i++) {
+      for (let j = i + 1; j < pts.length; j++) {
+        const s = dot(pts[i].emb, pts[j].emb);
+        if (s < far) { far = s; ia = i; ib = j; }
+      }
+    }
+    let ca = pts[ia].emb, cb = pts[ib].emb, A = [], B = [];
+    for (let it = 0; it < 8; it++) {
+      A = []; B = [];
+      for (const p of target.bank) (dot(p.emb, ca) >= dot(p.emb, cb) ? A : B).push(p);
+      if (!A.length || !B.length) return false;
+      ca = this._meanOf(A); cb = this._meanOf(B);
+    }
+    const mk = (bank, centroid) => ({ id: this._next++, centroid, bank, n: bank.length,
+                                      seconds: bank.reduce((s, x) => s + x.seconds, 0) });
+    const a = mk(A, ca), b = mk(B, cb);
+    this.clusters.splice(this.clusters.indexOf(target), 1, a, b);
+    for (const p of a.bank) this.assignment.set(p.index, a.id);
+    for (const p of b.bank) this.assignment.set(p.index, b.id);
+    return true;
+  }
+
+  /** Nearest cluster by cosine, or null if there are none yet. A provisional
+   *  label for a deferred segment, so the transcript never shows a blank —
+   *  resolveDeferred() decides for real once the centroids are built. */
+  nearest(emb) {
+    if (!this.clusters.length) return null;
+    const sims = this._similarities(emb);
+    let b = 0;
+    for (let i = 1; i < sims.length; i++) if (sims[i] > sims[b]) b = i;
+    return this.clusters[b].id;
   }
 
   finish() {

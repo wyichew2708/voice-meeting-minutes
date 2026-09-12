@@ -19,7 +19,13 @@ const PALETTE = ['#3b82f6', '#ef4444', '#10b981', '#f59e0b', '#8b5cf6', '#ec4899
 
 let settings = store.loadSettings();
 let capture = null, asr = null, clusterer = null, embedder = null;
-let session = null, segIndex = 0, pendingText = [], busy = false;
+let session = null, segIndex = 0, busy = false;
+
+// Browser-recogniser results waiting to be matched to a segment: {text, s, e}
+// in capture seconds. Google hears a start ~0.6 s late and finalises ~0.8 s
+// after the end; those offsets are subtracted before overlap is measured.
+let unplaced = [], placeTimer = null;
+const WS_START_LAG = 0.6, WS_END_LAG = 0.8;
 
 // Whisper only: consecutive turns by the same speaker are transcribed as one
 // call. Whisper on a 1.5 s snippet is far worse than Whisper on 10 s of the
@@ -69,8 +75,9 @@ async function start() {
   if (!settings.consentAcknowledged) { openConsent(); return; }
   setStatus('starting…');
   session = newSession();
+  session.targetSpeakers = parseInt($('speakerCount').value, 10) || null;
   segIndex = 0;
-  pendingText = [];
+  unplaced = [];
   embedder = new Embedder();
 
   if (settings.embedBackend === 'onnx' && settings.embedOnnxUrl) {
@@ -79,6 +86,7 @@ async function start() {
       const ORT = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/';
       const ort = await import(`${ORT}ort.wasm.min.mjs`);
       ort.env.wasm.wasmPaths = ORT;                 // else it looks for .wasm on this origin
+      ort.env.logLevel = 'error';                   // EP-assignment warnings are noise in a user's console
       setStatus('loading speaker model…');
       await embedder.useOnnx(settings.embedOnnxUrl, ort);
     } catch (e) {
@@ -95,16 +103,26 @@ async function start() {
   asr = makeASR(settings.asrEngine, {
     lang: settings.asrLang,
     model: settings.whisperModel,
-    quantized: settings.whisperDtype,
     device: settings.whisperDevice,
   });
 
+  const loadWhisper = async () => {
+    setStatus(`loading Whisper on ${asr.device} — the first run fetches ${asr.device === 'webgpu' ? '~300' : '~410'} MB, then it is cached`);
+    await asr.load(({ loaded, total, file }) => {
+      setStatus(`loading ${file?.split('/').pop() ?? 'model'} — ${Math.round(100 * loaded / total)}%`);
+    });
+  };
   try {
     if (settings.asrEngine === 'whisper') {
-      setStatus('loading Whisper — first run downloads the model');
-      await asr.load(({ loaded, total, file }) => {
-        setStatus(`downloading ${file?.split('/').pop() ?? 'model'} — ${Math.round(100 * loaded / total)}%`);
-      });
+      try { await loadWhisper(); }
+      catch (e) {
+        if (asr.device !== 'webgpu') throw e;
+        // No WebGPU here — Firefox, older Safari, some GPUs. wasm is slower
+        // (about real time on one thread) but it works everywhere.
+        warn(`WebGPU unavailable (${e.message.slice(0, 60)}) — Whisper will run on wasm, which is slower`);
+        asr = makeASR('whisper', { model: settings.whisperModel, device: 'wasm' });
+        await loadWhisper();
+      }
     } else {
       await asr.load();
     }
@@ -114,7 +132,7 @@ async function start() {
   asr.addEventListener('final', (e) => onWebSpeechFinal(e.detail));
   asr.addEventListener('asrerror', (e) => warn(`Recogniser: ${e.detail.message}`));
 
-  capture = new AudioCapture({ gate: settings.vadGate });
+  capture = new AudioCapture({ gate: settings.vadGate, processing: settings.micProcessing });
   capture.addEventListener('segment', (e) => onSegment(e.detail));
   capture.addEventListener('gatefallback', (e) =>
     warn(`Silero VAD did not load (${e.detail.reason.slice(0, 60)}) — using the energy gate; expect more false triggers.`));
@@ -152,14 +170,10 @@ async function end() {
   await capture.stop();
   clearTimeout(runTimer);
   await flushRun();
+  placeFinals(true);
   clusterer.finish();
-  // Deferral and re-clustering both rewrite assignments after the fact, so the
-  // rendered transcript has to be rebuilt from the final map, not trusted as
-  // it was drawn live. This is what makes a late merge fix earlier lines.
-  for (const l of session.lines) {
-    const cid = clusterer.assignment.get(l.index);
-    if (cid !== undefined && cid !== null) l.clusterId = cid;
-  }
+  if (session.targetSpeakers) clusterer.reclusterTo(session.targetSpeakers);
+  syncLabels();
   session.durationSeconds = capture.t;
   await matchVoiceprints();
   render();
@@ -167,6 +181,7 @@ async function end() {
   setRunning(false);
   capture = null;
   const found = new Set(session.lines.map(l => l.clusterId)).size;
+  if (session.droppedFinals) warn(`${session.droppedFinals} recognised phrase${session.droppedFinals === 1 ? '' : 's'} had no matching turn and were dropped`);
   if (embedder.backend !== 'onnx' && found > SPECTRAL_RELIABLE_SPEAKERS) {
     warn(`${session.lines.length} lines · ${found} speakers — past ${SPECTRAL_RELIABLE_SPEAKERS} voices the built-in embedder mislabels a lot. Expect to merge and rename, or switch to the ECAPA model.`);
   } else {
@@ -183,20 +198,26 @@ async function onSegment(seg) {
   const cid = clusterer.add(index, emb, seg.seconds);
 
   const line = {
-    index, t0: seg.start, seconds: seg.seconds,
-    clusterId: cid ?? -1, text: '', pending: cid === null,
+    index, t0: seg.start, seconds: seg.seconds, text: '',
+    // A deferred segment gets its nearest centroid as a provisional label
+    // rather than a blank; resolveDeferred() settles it at End.
+    clusterId: cid ?? clusterer.nearest(emb) ?? 0, provisional: cid === null,
   };
   session.lines.push(line);
+  syncLabels();
   store.putClip(`${session.id}:${index}`, toWav(seg.pcm)).catch(() => {});
 
-  if (settings.asrEngine === 'whisper') {
-    queueForWhisper(seg, line, cid);
-  } else {
-    // The browser recogniser is on its own clock. Text that already arrived is
-    // claimed here; text that has not yet is claimed when it does.
-    const waiting = pendingText.shift();
-    if (waiting) { line.text = waiting; }
-    render();
+  if (settings.asrEngine === 'whisper') queueForWhisper(seg, line, cid);
+  else { placeFinals(); render(); }
+}
+
+/** Re-clustering and deferral rewrite assignments after the fact. The
+ *  transcript follows them as they happen, so an early over-split visibly
+ *  heals when the recluster pass merges it, instead of only at End. */
+function syncLabels() {
+  for (const l of session.lines) {
+    const cid = clusterer.assignment.get(l.index);
+    if (cid !== undefined && cid !== null) { l.clusterId = cid; l.provisional = false; }
   }
 }
 
@@ -231,11 +252,43 @@ async function flushRun() {
   render();
 }
 
-function onWebSpeechFinal({ text }) {
-  const line = [...session.lines].reverse().find(l => !l.text);
-  if (line) { line.text = text; render(); }
-  else pendingText.push(text);       // audio segment has not been cut yet
+function onWebSpeechFinal({ text, wallStart, wallEnd }) {
+  const toCapture = (ms) => (ms - capture.startedAt) / 1000;
+  unplaced.push({ text, s: toCapture(wallStart) - WS_START_LAG, e: toCapture(wallEnd) - WS_END_LAG });
+  placeFinals();
   showInterim('');
+  // If no segment arrives to trigger placement (the gate is still in its
+  // hangover, or trimmed the turn away), try again shortly.
+  clearTimeout(placeTimer);
+  placeTimer = setTimeout(() => placeFinals(), 3500);
+}
+
+/** Match each waiting result to the segment it overlaps most. One result per
+ *  segment is the norm; a second is appended, and a result nothing overlaps
+ *  goes to the nearest segment within 4 s or is counted as dropped. */
+function placeFinals(force = false) {
+  const now = force || !capture ? Infinity : capture.t;
+  const keep = [];
+  const append = (l, t) => { l.text = l.text ? `${l.text} ${t}` : t; };
+  for (const f of unplaced) {
+    let best = null, bestOv = 0;
+    for (const l of session.lines) {
+      const ov = Math.min(f.e, l.t0 + l.seconds) - Math.max(f.s, l.t0);
+      if (ov > bestOv) { bestOv = ov; best = l; }
+    }
+    if (best && bestOv >= Math.min(0.5, 0.3 * Math.max(0.1, f.e - f.s))) { append(best, f.text); continue; }
+    if (now - f.e < 3.0) { keep.push(f); continue; }          // its segment may still be coming
+    const mid = (f.s + f.e) / 2;
+    let near = null, nd = 4.0;
+    for (const l of session.lines) {
+      const d = Math.abs(l.t0 + l.seconds / 2 - mid);
+      if (d < nd) { nd = d; near = l; }
+    }
+    if (near) append(near, f.text);
+    else session.droppedFinals = (session.droppedFinals || 0) + 1;
+  }
+  unplaced = keep;
+  render();
 }
 
 /* ────────────────────────────────────────────────────────────── rendering ── */
@@ -253,7 +306,7 @@ function render() {
     row.className = 'line' + (pending ? ' pending' : '');
     const cid = l.clusterId;
     const tag = document.createElement('button');
-    tag.className = 'who';
+    tag.className = 'who' + (l.provisional ? ' provisional' : '');
     tag.style.background = colourFor(cid);
     tag.textContent = nameFor(cid);
     tag.title = 'Double-click to rename this speaker everywhere';
@@ -288,6 +341,19 @@ function showInterim(text) {
   const el = $('interim');
   el.textContent = text;
   el.classList.toggle('on', !!text);
+}
+
+/** The user knows how many people are in the room; the thresholds only guess. */
+function applySpeakerCount() {
+  const n = parseInt($('speakerCount').value, 10) || 0;
+  if (session) session.targetSpeakers = n || null;
+  if (!clusterer || !session) return;
+  if (!n) { setStatus('speaker count: automatic'); return; }
+  const changed = clusterer.reclusterTo(n);
+  syncLabels();
+  render();
+  setStatus(`re-clustered to ${n} speakers — ${changed} line${changed === 1 ? '' : 's'} relabelled`);
+  store.saveSession(session).catch(() => {});
 }
 
 async function rename(cid) {
@@ -397,17 +463,17 @@ function openConsent() { $('consent').showModal(); }
 
 function bindSettings() {
   const map = {
-    asrEngine: 'asrEngine', asrLang: 'asrLang', vadGate: 'vadGate', whisperModel: 'whisperModel',
-    whisperDtype: 'whisperDtype', whisperDevice: 'whisperDevice',
+    asrEngine: 'asrEngine', asrLang: 'asrLang', vadGate: 'vadGate', micProcessing: 'micProcessing',
+    whisperModel: 'whisperModel', whisperDevice: 'whisperDevice',
     embedBackend: 'embedBackend', embedOnnxUrl: 'embedOnnxUrl',
     llmBaseUrl: 'llmBaseUrl', llmApiKey: 'llmApiKey', llmModel: 'llmModel', llmFormat: 'llmFormat',
   };
   for (const [key, id] of Object.entries(map)) {
     const el = $(id);
     if (!el) continue;
-    el.value = settings[key] ?? '';
+    if (el.type === 'checkbox') el.checked = !!settings[key]; else el.value = settings[key] ?? '';
     el.onchange = () => {
-      settings[key] = el.value;
+      settings[key] = el.type === 'checkbox' ? el.checked : el.value;
       store.saveSettings(settings);
       reflectEngine();
       reflectEmbedder();
@@ -471,6 +537,7 @@ export function init() {
   $('end').onclick = end;
   $('generate').onclick = generate;
   $('openSettings').onclick = openSettings;
+  $('speakerCount').onchange = applySpeakerCount;
   $('exportMd').onclick = () => download(`minutes-${session?.date ?? 'draft'}.md`, $('minutesBody').dataset.md || '');
   $('exportTxt').onclick = () => {
     const lines = session.lines.filter(l => l.text).map(l => ({ t0: l.t0, speaker: nameFor(l.clusterId), text: l.text }));

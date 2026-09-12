@@ -172,5 +172,30 @@ for (const n of [2, 4, 8, 10, 12]) {
         `${c.toFixed(1)} clusters, ${(conf * 100).toFixed(1)}% confusion`);
 }
 
+console.log('\nknown headcount: reclusterTo(n) repairs both directions');
+{
+  const runTo = (n, cfg, target, seed) => {
+    const room = new Room(n, seed), segs = turns(n, 45, seed);
+    const cl = new OnlineClusterer(cfg);
+    for (const s of segs) cl.add(s.index, room.embed(s.speaker, s.seconds), s.seconds);
+    cl.finish();
+    const auto = score(segs, cl.assignment);
+    cl.reclusterTo(target);
+    return { auto, fixed: score(segs, cl.assignment), clusters: cl.clusters.length };
+  };
+  const over = SEEDS.map(s => runTo(10, DESIGNED, 10, s));            // ~128 clusters -> merge down
+  const under = SEEDS.map(s => runTo(10, { ...SHIPPING, threshold: 0.30 }, 10, s));  // ~1 cluster -> split up
+  const exact = SEEDS.map(s => runTo(12, SHIPPING, 12, s));           // already right -> stays right
+  const fewer = SEEDS.map(s => runTo(10, SHIPPING, 6, s));            // user says 6 -> 6
+  const m = (xs, f) => mean(xs.map(f));
+  check('over-split 10 -> told 10', m(over, r => r.clusters) === 10 && m(over, r => r.fixed.confusion) < 0.05,
+        `${m(over, r => r.auto.clusters).toFixed(0)} clusters auto -> ${m(over, r => r.clusters)} fixed, ${(m(over, r => r.fixed.confusion) * 100).toFixed(1)}% confusion`);
+  check('under-split 10 -> told 10', m(under, r => r.clusters) === 10 && m(under, r => r.fixed.confusion) < 0.15,
+        `${m(under, r => r.auto.clusters).toFixed(1)} clusters auto (${(m(under, r => r.auto.confusion) * 100).toFixed(0)}% confusion) -> ${m(under, r => r.clusters)} fixed, ${(m(under, r => r.fixed.confusion) * 100).toFixed(1)}% confusion`);
+  check('exact 12 -> told 12 stays exact', m(exact, r => r.clusters) === 12 && m(exact, r => r.fixed.confusion) < 0.02,
+        `${m(exact, r => r.clusters)} clusters, ${(m(exact, r => r.fixed.confusion) * 100).toFixed(1)}% confusion`);
+  check('10 people -> told 6 gives 6', m(fewer, r => r.clusters) === 6, `${m(fewer, r => r.clusters)} clusters`);
+}
+
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed');
 process.exit(failures ? 1 : 0);

@@ -1,29 +1,34 @@
 #!/usr/bin/env python3
-"""Export a Singlish-finetuned Whisper to ONNX for transformers.js.
+"""Export a Singlish-finetuned Whisper to ONNX for transformers.js — the recipe
+that actually worked, not the one that looked right.
 
-None of the Singlish finetunes publish ONNX weights — they are safetensors
-only — and transformers.js needs ONNX. This does the conversion once. The
-output goes in web/models/<name>/, which the app loads when the model is set
-to "local export".
+None of the Singlish finetunes publish ONNX weights and transformers.js needs
+them. This drives the official transformers.js conversion script inside an
+isolated venv, with the two pins it took three attempts to find:
 
-    pip install "optimum[onnxruntime]" onnx
-    python3 tools/export_singlish_onnx.py                    # small, q8
+  * torch 2.5.1 — newer torch routes torch.onnx.export through the dynamo
+    exporter, which writes encoder_model.onnx_data; optimum expects the legacy
+    exporter's .onnx.data and crashes with FileNotFoundError after the export.
+  * onnxscript — imported by torch.onnx on newer torch even on the legacy path.
+
+    python3 tools/export_singlish_onnx.py                                  # small, q8
     python3 tools/export_singlish_onnx.py --model mjwong/whisper-large-v3-turbo-singlish
+
+Output: web/models/<model id>/ with the configs and tokenizer beside four
+graphs — encoder + merged decoder in q4 (~300 MB, what WebGPU loads) and in q8
+(~410 MB, what wasm loads) — the layout transformers.js reads as
+`local/<model id>`, the value already in Settings. Weights download once
+(~1 GB for small, ~3.2 GB for the turbo). fp32 graphs are removed unless
+--keep-fp32; q8 on WebGPU is never loaded because it produces garbage.
 
 Why these models — WER on SASRBench-v1, spontaneous Singlish:
 
     openai/whisper-small                     147.80%   unusable
     mjwong/whisper-small-singlish             18.49%   Apache-2.0, 0.2B
-    openai/whisper-large-v3-turbo              27.58%
     mjwong/whisper-large-v3-turbo-singlish    13.35%   MIT, 0.8B
 
-Vanilla Whisper above 100% WER means it inserts more words than the reference
-contains. The finetune is not an optimisation here; it is the difference
-between working and not.
-
-⚠ These are trained on IMDA National Speech Corpus close-talk read speech.
-   A boardroom far-field microphone is a different acoustic problem and none
-   of these numbers predict it. Tune on real recordings of the real room.
+sim/singlish_wer_reference.py reproduces 18.5% on a 30-clip sample through
+PyTorch, and the self-test page reproduces it through the browser export.
 """
 from __future__ import annotations
 
@@ -35,61 +40,70 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 OUT_ROOT = ROOT / "web" / "models"
+TJS_TAG = "3.7.5"                      # the transformers.js the app loads from the CDN
+UNUSED = ["decoder_model.onnx", "decoder_with_past_model.onnx",
+          "decoder_model_quantized.onnx", "decoder_with_past_model_quantized.onnx",
+          "decoder_model_q4.onnx", "decoder_with_past_model_q4.onnx"]
+FP32 = ["encoder_model.onnx", "decoder_model_merged.onnx"]
 
-MODELS = {
-    "mjwong/whisper-small-singlish": "whisper-singlish-onnx",
-    "mjwong/whisper-large-v3-turbo-singlish": "whisper-singlish-turbo-onnx",
-    "jensenlwt/whisper-small-singlish-122k": "whisper-singlish-122k-onnx",
-}
+
+def sh(cmd, cwd=None, quiet=False):
+    print("  $ " + " ".join(str(c) for c in cmd), flush=True)
+    r = subprocess.run(cmd, cwd=cwd, stdout=subprocess.PIPE if quiet else None,
+                       stderr=subprocess.STDOUT if quiet else None, text=True)
+    if r.returncode != 0:
+        if quiet and r.stdout:
+            print(r.stdout[-3000:])
+        raise SystemExit(f"failed: {' '.join(str(c) for c in cmd)}")
+    return r
 
 
 def main() -> int:
-    ap = argparse.ArgumentParser(description=__doc__,
-                                 formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--model", default="mjwong/whisper-small-singlish",
-                    help="Hugging Face model id (default: %(default)s)")
-    ap.add_argument("--out", default=None, help="output directory name under web/models/")
-    ap.add_argument("--quantize", default="q8", choices=["q8", "fp16", "none"],
-                    help="weight precision for the browser (default: %(default)s)")
-    args = ap.parse_args()
+    ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
+    ap.add_argument("--model", default="mjwong/whisper-small-singlish")
+    ap.add_argument("--cache", default=str(Path.home() / ".cache" / "voice-meeting-minutes" / "tjs"),
+                    help="where the venv and the transformers.js checkout live")
+    ap.add_argument("--keep-fp32", action="store_true", help="keep the fp32 graphs next to the q8 ones")
+    a = ap.parse_args()
 
-    try:
-        import optimum  # noqa: F401
-    except ImportError:
-        print('optimum is not installed. Run:\n\n    pip install "optimum[onnxruntime]" onnx\n',
-              file=sys.stderr)
-        return 1
+    cache = Path(a.cache)
+    repo, venv = cache / "repo", cache / "venv"
+    cache.mkdir(parents=True, exist_ok=True)
+    py = venv / "bin" / "python"
 
-    name = args.out or MODELS.get(args.model, args.model.split("/")[-1] + "-onnx")
-    out = OUT_ROOT / name
-    out.mkdir(parents=True, exist_ok=True)
+    print("1/4  transformers.js conversion script")
+    if not repo.exists():
+        try:
+            sh(["git", "clone", "-q", "--depth", "1", "--branch", TJS_TAG,
+                "https://github.com/huggingface/transformers.js.git", str(repo)])
+        except SystemExit:
+            sh(["git", "clone", "-q", "--depth", "1", "https://github.com/huggingface/transformers.js.git", str(repo)])
 
-    print(f"exporting {args.model}\n     -> {out}")
-    cmd = [sys.executable, "-m", "optimum.exporters.onnx",
-           "--model", args.model, "--task", "automatic-speech-recognition-with-past",
-           "--opset", "14", str(out)]
-    r = subprocess.run(cmd)
-    if r.returncode != 0:
-        print("export failed", file=sys.stderr)
-        return r.returncode
+    print("2/4  isolated venv (your global Python is not touched)")
+    if not py.exists():
+        sh([sys.executable, "-m", "venv", str(venv)])
+    sh([str(py), "-m", "pip", "install", "-q", "--upgrade", "pip"], quiet=True)
+    sh([str(py), "-m", "pip", "install", "-q", "-r", str(repo / "scripts" / "requirements.txt")], quiet=True)
+    sh([str(py), "-m", "pip", "install", "-q", "onnxscript", "torch==2.5.1"], quiet=True)
 
-    # transformers.js expects the graphs under onnx/ and, for a quantized build,
-    # the _quantized suffix it looks for by dtype.
-    onnx_dir = out / "onnx"
-    onnx_dir.mkdir(exist_ok=True)
-    for f in out.glob("*.onnx*"):
-        shutil.move(str(f), onnx_dir / f.name)
+    print(f"3/4  export {a.model} -> {OUT_ROOT / a.model}  (downloads the weights on first run)")
+    sh([str(py), "-m", "scripts.convert", "--quantize", "--modes", "q8", "q4",
+        "--model_id", a.model, "--task", "automatic-speech-recognition-with-past",
+        "--output_parent_dir", str(OUT_ROOT), "--skip_validation"], cwd=repo)
 
-    if args.quantize != "none":
-        print(f"quantizing to {args.quantize}")
-        q = subprocess.run([sys.executable, "-m", "onnxruntime.quantization.preprocess",
-                            "--input", str(onnx_dir)], capture_output=True)
-        if q.returncode != 0:
-            print("  (skipped: onnxruntime quantization tools not available — "
-                  "the fp32 export still works, it is just larger)", file=sys.stderr)
-
-    print(f"\ndone. In the app: Settings -> Whisper -> model 'local export'.")
-    print(f"Serve the app from web/ so ./models/{name}/ is reachable.")
+    print("4/4  prune graphs transformers.js does not load")
+    onnx = OUT_ROOT / a.model / "onnx"
+    for f in UNUSED + ([] if a.keep_fp32 else FP32):
+        p = onnx / f
+        if p.exists():
+            p.unlink()
+    for f in sorted(onnx.glob("*.onnx")):
+        print(f"     {f.stat().st_size / 1e6:7.1f} MB  {f.relative_to(OUT_ROOT)}")
+    need = [onnx / f for f in ("encoder_model_quantized.onnx", "decoder_model_merged_quantized.onnx",
+                               "encoder_model_q4.onnx", "decoder_model_merged_q4.onnx")]
+    if not all(p.exists() for p in need):
+        raise SystemExit("export did not produce the q8 and q4 encoder + merged decoder pairs")
+    print(f"\ndone. In the app: Settings -> Speech recognition -> Whisper -> 'local/{a.model}'")
     return 0
 
 

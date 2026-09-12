@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Voice Meeting Minutes — self-test</title>
+<link rel="stylesheet" href="css/styles.css">
+<style>
+  body { padding: 20px; max-width: 920px; margin: 0 auto; }
+  h1 { font-size: 20px; margin: 0 0 6px; } h2 { font-size: 15px; margin: 30px 0 8px; }
+  pre { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; padding: 12px;
+        font: 12px/1.5 ui-monospace, Menlo, monospace; white-space: pre-wrap; min-height: 40px; }
+  blockquote { margin: 8px 0; padding: 8px 12px; border-left: 3px solid var(--accent); color: var(--muted); }
+  p, li { color: var(--muted); font-size: 13.5px; }
+  .ok { color: var(--ok); } .bad { color: var(--bad); } .warn { color: var(--warn); }
+</style>
+</head>
+<body>
+<h1>Self-test</h1>
+<p>Two checks. The first needs no microphone and proves the recording pipeline in <em>this</em>
+   browser matches the reference — gate, clock, resampling, speaker model. The second records you
+   and reports what your microphone and room look like to the speaker model. Paste either block
+   back to whoever is debugging with you.</p>
+
+<h2>1. Pipeline, no microphone</h2>
+<p>Plays three reference utterances into the live capture path as if they were a microphone.</p>
+<button id="run1" class="primary">Run</button>
+<pre id="out1">—</pre>
+
+<h2>2. Your microphone and room</h2>
+<p>Press <em>Record</em>, then read this aloud in your normal voice, pause two seconds, and read it
+   again. Sit where you would in a real meeting.</p>
+<blockquote>The claims backlog is sitting at about three hundred and forty cases this week,
+   so let's hire two temps and review the numbers again at the end of October.</blockquote>
+<button id="run2" class="primary">Record 14 s</button>
+<pre id="out2">—</pre>
+
+<h2>3. Singlish recognition — Whisper, local</h2>
+<p>Transcribes 30 clips of spontaneous Singlish from
+   <a href="https://huggingface.co/datasets/mjwong/SASRBench-v1">SASRBench-v1</a> with the local
+   <code>whisper-small-singlish</code> export and scores them against the reference transcripts.
+   The same model in fp32 PyTorch scores <strong>18.5%</strong> WER on these clips
+   (<code>sim/singlish_wer_reference.py</code>); the model card reports 18.49% on the full benchmark
+   and 147.80% for vanilla <code>whisper-small</code>. Needs <code>web/models/_test/sasr/</code> and
+   the local export; ~300 MB (WebGPU, q4) or ~410 MB (wasm, q8) loads on first run.</p>
+<div class="row">
+  <button id="run3" class="primary">Run on wasm</button>
+  <button id="run3gpu">Run on WebGPU</button>
+</div>
+<pre id="out3">—</pre>
+
+<script type="module">
+import { AudioCapture } from './js/audio.js';
+import { Embedder } from './js/embed.js';
+import { WhisperASR, looksHallucinated } from './js/asr.js';
+
+const ORT = 'https://cdn.jsdelivr.net/npm/onnxruntime-web@1.29.0/dist/';
+const $ = (id) => document.getElementById(id);
+const log = (el, s = '') => { el.textContent += s + '\n'; };
+const dot = (a, b) => { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * b[i]; return s; };
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+async function loadEmbedder(out) {
+  const ort = await import(`${ORT}ort.wasm.min.mjs`);
+  ort.env.wasm.wasmPaths = ORT;
+  const e = new Embedder();
+  try { await e.useOnnx('models/wespeaker_en_voxceleb_CAM++.onnx', ort); }
+  catch (err) { log(out, `speaker model NOT loaded (${err.message.slice(0, 80)}) — run: python3 tools/fetch_models.py`); }
+  log(out, `speaker model: ${e.label}`);
+  return e;
+}
+
+$('run1').onclick = async () => {
+  const out = $('out1'); out.textContent = '';
+  let ctx;
+  try {
+    ctx = new AudioContext();
+    await ctx.resume();
+    log(out, `AudioContext ${ctx.sampleRate} Hz (${ctx.state}) — the capture path must resample this to 16 kHz`);
+    const refRes = await fetch('models/_test/campp_ref.json');
+    if (!refRes.ok) { log(out, 'missing web/models/_test — run: python3 sim/campp_reference.py'); return; }
+    const ref = await refRes.json();
+    const files = Object.keys(ref);
+    const bufs = [];
+    for (const f of files) bufs.push(await ctx.decodeAudioData(await (await fetch(`models/_test/${f}`)).arrayBuffer()));
+
+    const emb = await loadEmbedder(out);
+    const dest = ctx.createMediaStreamDestination();
+    const cap = new AudioCapture({ gate: 'silero', stream: dest.stream });
+    const segs = [];
+    cap.addEventListener('segment', e => segs.push(e.detail));
+    cap.addEventListener('gatefallback', e => log(out, `gate fallback: ${e.detail.reason}`));
+    const wall0 = performance.now();
+    await cap.start();
+    log(out, `gate: ${cap.gate}`);
+
+    // 1 s of silence, then the files with 1.5 s gaps — measured from when audio started flowing
+    let t = ctx.currentTime + 1.0;
+    const expected = [];
+    bufs.forEach((b, i) => {
+      const src = ctx.createBufferSource(); src.buffer = b; src.connect(dest); src.start(t);
+      expected.push({ file: files[i], start: t - ctx.currentTime - 0.25, dur: b.duration });   // capture clock starts ~now; 0.25 s pre-roll
+      t += b.duration + 1.5;
+    });
+    const total = t - ctx.currentTime + 2.5;
+    for (let s = Math.ceil(total); s > 0; s--) { out.textContent = out.textContent.replace(/\n…\d+ s$/, '') + `\n…${s} s`; await sleep(1000); }
+    out.textContent = out.textContent.replace(/\n…\d+ s$/, '');
+    await cap.stop();
+    const elapsed = (performance.now() - wall0) / 1000;
+
+    const clockOk = Math.abs(cap.t - elapsed) < 1.5;
+    log(out, `audio clock ${cap.t.toFixed(1)} s vs wall ${elapsed.toFixed(1)} s — ${clockOk ? 'OK' : 'MISMATCH: frames are not arriving at 16 kHz'}`);
+    log(out, `segments: ${segs.length} (expected ${files.length})`);
+    let allOk = segs.length === files.length;
+    for (let i = 0; i < segs.length; i++) {
+      const s = segs[i], f = files[Math.min(i, files.length - 1)];
+      const cw = dot(await emb.embed(s.embedPcm), Float32Array.from(ref[f]));
+      const cc = dot(await emb.embed(s.pcm), Float32Array.from(ref[f]));
+      const ok = Math.max(cw, cc) > 0.9;
+      allOk = allOk && ok;
+      log(out, `  #${i + 1}  start ${s.start.toFixed(2)} s (expected ~${expected[i]?.start.toFixed(2)}), speech ${s.seconds.toFixed(2)} s (file ${expected[i]?.dur.toFixed(2)})`);
+      log(out, `      cosine vs reference ${f}: embed clip ${cw.toFixed(3)}  asr clip ${cc.toFixed(3)}  ${ok ? 'OK' : 'LOW — embeddings in this browser do not match the reference'}`);
+    }
+    log(out, allOk && clockOk ? '\nPASS — this browser\'s live pipeline matches the reference.' : '\nFAIL — see above.');
+  } catch (e) { log(out, 'ERROR ' + (e.stack || e)); }
+  finally { try { await ctx?.close(); } catch {} }
+};
+
+/* ── 3. Singlish recognition ─────────────────────────────────────────────── */
+
+function parseWav(buf) {                       // 16-bit PCM mono 16 kHz, as the clips are
+  const v = new DataView(buf); let off = 12, data = null;
+  while (off + 8 <= buf.byteLength) {
+    const id = String.fromCharCode(v.getUint8(off), v.getUint8(off + 1), v.getUint8(off + 2), v.getUint8(off + 3));
+    const size = v.getUint32(off + 4, true);
+    if (id === 'data') data = new Int16Array(buf.slice(off + 8, off + 8 + size));
+    off += 8 + size + (size & 1);
+  }
+  const f = new Float32Array(data.length);
+  for (let i = 0; i < data.length; i++) f[i] = data[i] / 32768;
+  return f;
+}
+// Same conventions as sim/singlish_wer_reference.py: (ppl) (uh) and !huh! are
+// non-lexical and dropped, [ah] [lah] are kept, b_a is a spelled acronym.
+const normalise = (t) => t.toLowerCase().replace(/\([^)]*\)/g, ' ').replace(/![^!]*!/g, ' ')
+  .replace(/_/g, ' ').replace(/[\[\]]/g, '').replace(/[^a-z0-9' ]+/g, ' ').split(/\s+/).filter(Boolean);
+function edits(ref, hyp) {
+  let d = Array.from({ length: hyp.length + 1 }, (_, j) => j);
+  for (let i = 1; i <= ref.length; i++) {
+    let prev = d[0]; d[0] = i;
+    for (let j = 1; j <= hyp.length; j++) {
+      const cur = Math.min(d[j] + 1, d[j - 1] + 1, prev + (ref[i - 1] !== hyp[j - 1] ? 1 : 0));
+      prev = d[j]; d[j] = cur;
+    }
+  }
+  return d[hyp.length];
+}
+
+async function runWhisper(device) {
+  const out = $('out3'); out.textContent = '';
+  window.__wer = { running: true, done: 0, total: 0, device };
+  try {
+    const idxRes = await fetch('models/_test/sasr/index.json');
+    if (!idxRes.ok) { log(out, 'missing web/models/_test/sasr — see docs/html-version.md for how the clips are fetched'); return; }
+    const index = await idxRes.json();
+    const ref = await fetch('models/_test/sasr/reference_hyps.json').then(r => r.ok ? r.json() : null).catch(() => null);
+    const asr = new WhisperASR({ model: 'local/mjwong/whisper-small-singlish', device, language: 'en' });   // precision per device, as the app
+    let t0 = performance.now();
+    await asr.load(({ file, loaded, total }) => { out.textContent = `loading ${file?.split('/').pop()} ${Math.round(100 * loaded / total)}%`; });
+    out.textContent = '';
+    log(out, `model loaded on ${device} in ${((performance.now() - t0) / 1000).toFixed(1)} s`);
+    let errs = 0, words = 0, secs = 0, infer = 0, flagged = 0;
+    window.__wer.total = index.length;
+    for (const m of index) {
+      const pcm = parseWav(await (await fetch('models/_test/sasr/' + m.file)).arrayBuffer());
+      const s = pcm.length / 16000;
+      const t1 = performance.now();
+      const res = await asr.pipe(pcm, { language: 'en', task: 'transcribe', chunk_length_s: 30, return_timestamps: false });
+      const dt = (performance.now() - t1) / 1000; infer += dt; secs += s;
+      const hyp = (res?.text ?? '').trim();
+      if (looksHallucinated(hyp, s)) flagged++;
+      const r = normalise(m.transcript), h = normalise(hyp), e = edits(r, h);
+      errs += e; words += r.length; window.__wer.done++;
+      const py = ref?.clips?.[m.file] ? `  py ${(100 * ref.clips[m.file].wer).toFixed(1)}%` : '';
+      log(out, `  ${m.file}  ${s.toFixed(1)}s  WER ${(100 * e / Math.max(1, r.length)).toFixed(1).padStart(5)}%${py}  ${(dt / s).toFixed(2)}x RT  ${hyp.slice(0, 56)}`);
+    }
+    const wer = errs / words;
+    log(out, `\nWER ${(100 * wer).toFixed(1)}% over ${words} words, ${index.length} clips — fp32 Python reference ${ref ? (100 * ref.wer).toFixed(1) + '%' : '18.5%'}; model card 18.49%; vanilla whisper-small 147.80%`);
+    log(out, `speed ${(infer / secs).toFixed(2)}x real time on ${device}; the hallucination filter would drop ${flagged} of ${index.length} clips`);
+    log(out, Math.abs(wer - (ref?.wer ?? 0.185)) < 0.03 ? '\nPASS — the browser export reproduces the reference.' : '\nCHECK — the browser result differs from the reference by more than 3 points.');
+    window.__wer.summary = { wer, words, rtf: infer / secs, flagged, device };
+  } catch (e) { log(out, 'ERROR ' + (e.stack || e)); }
+  finally { window.__wer.running = false; }
+}
+$('run3').onclick = () => runWhisper('wasm');
+$('run3gpu').onclick = () => runWhisper('webgpu');
+
+$('run2').onclick = async () => {
+  const out = $('out2'); out.textContent = '';
+  try {
+    const emb = await loadEmbedder(out);
+    const cap = new AudioCapture({ gate: 'silero' });
+    const segs = []; let peak = 0, speechFrames = 0, frames = 0;
+    cap.addEventListener('segment', e => segs.push(e.detail));
+    cap.addEventListener('level', e => { frames++; if (e.detail.speech) speechFrames++; if (e.detail.level > peak) peak = e.detail.level; });
+    cap.addEventListener('gatefallback', e => log(out, `gate fallback: ${e.detail.reason}`));
+    await cap.start();
+    log(out, `gate: ${cap.gate}`);
+    log(out, `microphone as the browser reports it: ${JSON.stringify(cap.trackSettings)}`);
+    for (let s = 14; s > 0; s--) { out.textContent = out.textContent.replace(/\n…recording.*$/, '') + `\n…recording ${s}`; await sleep(1000); }
+    out.textContent = out.textContent.replace(/\n…recording.*$/, '');
+    await cap.stop();
+    log(out, `peak level ${peak.toFixed(3)} — ${peak < 0.02 ? 'very quiet: move closer or raise the input gain' : peak > 0.9 ? 'clipping: too loud' : 'fine'}; speech in ${(100 * speechFrames / Math.max(1, frames)).toFixed(0)}% of frames`);
+    log(out, `segments: ${segs.length}${segs.length === 0 ? ' — nothing was gated as speech' : ''}`);
+    const embs = [];
+    for (const s of segs) { embs.push(await emb.embed(s.embedPcm)); log(out, `  start ${s.start.toFixed(1)} s, speech ${s.seconds.toFixed(1)} s`); }
+    if (embs.length >= 2) {
+      log(out, '\ncosine between your own segments — one voice should read > 0.6; the speaker-change threshold is 0.65:');
+      for (let i = 0; i < embs.length; i++) log(out, '  ' + embs.map(e => dot(embs[i], e).toFixed(2)).join('  '));
+      const offDiag = []; for (let i = 0; i < embs.length; i++) for (let j = i + 1; j < embs.length; j++) offDiag.push(dot(embs[i], embs[j]));
+      const mn = Math.min(...offDiag);
+      log(out, mn > 0.65 ? '\nOK — your segments would cluster as one person.' : mn > 0.5 ? '\nBORDERLINE — some of your own segments would split into two speakers in this room.' : '\nLOW — this room/mic is splitting one voice into several. Try: closer to the mic, browser audio processing off, a quieter room.');
+    }
+    log(out, '\nPaste this block back.');
+  } catch (e) { log(out, 'ERROR ' + (e.message || e)); }
+};
+</script>
+</body>
+</html>

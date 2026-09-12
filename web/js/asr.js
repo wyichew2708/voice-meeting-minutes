@@ -13,9 +13,12 @@
  *     is the reason §9's consent flow is not optional here.
  *   ⚠ No Singlish tuning. `en-SG` is requested where supported, but what that
  *     maps to server-side is not documented and not guaranteed.
- *   ⚠ It runs on its own clock, not on our segmenter's. Text is matched to the
- *     nearest segment by time, so speaker attribution is approximate —
- *     good enough to read, not exact at a fast interruption.
+ *   ⚠ It runs on its own clock, not on our segmenter's. Each result carries
+ *     the wall time it was first heard and the time it was finalised, and
+ *     the app matches it to the segment it overlaps most. Approximate: good
+ *     enough to read, not exact at a fast interruption, and one result that
+ *     spans two speakers lands on whichever it overlaps more. Whisper, which
+ *     transcribes exactly the clip cut for each speaker, has none of this.
  *
  * ── 'whisper' ──────────────────────────────────────────────────────────────
  * A Singlish-finetuned Whisper via transformers.js, ONNX, WebGPU. Fully local:
@@ -65,16 +68,20 @@ export class WebSpeechASR extends EventTarget {
     this.rec.interimResults = true;
     this.rec.maxAlternatives = 1;
 
+    this._starts = new Map();                    // result index -> wall time first seen
     this.rec.onresult = (e) => {
       let interim = '';
+      const now = performance.now();
       for (let i = e.resultIndex; i < e.results.length; i++) {
         const r = e.results[i];
+        if (!this._starts.has(i)) this._starts.set(i, now);
         const text = r[0].transcript.trim();
         if (!text) continue;
         if (r.isFinal) {
           this.dispatchEvent(new CustomEvent('final', {
-            detail: { text, at: performance.now() / 1000, confidence: r[0].confidence },
+            detail: { text, wallStart: this._starts.get(i), wallEnd: now, confidence: r[0].confidence },
           }));
+          this._starts.delete(i);
         } else {
           interim += text + ' ';
         }
@@ -86,7 +93,8 @@ export class WebSpeechASR extends EventTarget {
 
     // Chrome ends the session on its own every so often; restart unless we
     // were the ones who stopped it.
-    this.rec.onend = () => { if (this.wantRunning) { try { this.rec.start(); } catch {} } };
+    // Chrome restarts number results from 0 again, so forget the old ones.
+    this.rec.onend = () => { this._starts.clear(); if (this.wantRunning) { try { this.rec.start(); } catch {} } };
     this.rec.onerror = (e) => {
       if (e.error === 'no-speech' || e.error === 'aborted') return;
       this.dispatchEvent(new CustomEvent('asrerror', { detail: { message: e.error } }));
@@ -108,8 +116,22 @@ export class WebSpeechASR extends EventTarget {
 
 /* ──────────────────────────────────────────────────────── whisper, local ── */
 
+/** Which precision to load for which backend — measured, not assumed
+ *  (docs/html-version.md, "In the browser"):
+ *
+ *    WebGPU   q4 encoder + q4 decoder   ~300 MB   0.08-0.10x real time   text identical to fp32
+ *    WebGPU   q8                        garbage ("!!!!!!") at 3x real time — never
+ *    wasm     q8                        ~410 MB   0.84x real time on one thread, 0.24x on four
+ *
+ *  'auto' picks from that table; anything else is passed straight to
+ *  transformers.js for experiments. */
+export function whisperDtypeFor(device, requested = 'auto') {
+  if (requested && requested !== 'auto') return requested;
+  return device === 'webgpu' ? { encoder_model: 'q4', decoder_model_merged: 'q4' } : 'q8';
+}
+
 export class WhisperASR extends EventTarget {
-  constructor({ model, quantized = 'q8', device = 'webgpu', language = 'en' } = {}) {
+  constructor({ model, quantized = 'auto', device = 'webgpu', language = 'en' } = {}) {
     super();
     this.model = model;
     this.quantized = quantized;
@@ -120,15 +142,17 @@ export class WhisperASR extends EventTarget {
 
   async load(onProgress) {
     const { pipeline, env } = await import(/* @vite-ignore */ `${TRANSFORMERS_CDN}`);
+    env.backends.onnx.logLevel = 'error';   // ORT prints EP-assignment warnings via console.error; noise here
     // A model served from this origin (tools/export_singlish_onnx.py drops it
     // in web/models/) should be found there rather than on the Hub.
     if (this.model.startsWith('local/')) {
+      env.allowLocalModels = true;      // off by default in browsers — without this nothing is allowed at all
       env.allowRemoteModels = false;
       env.localModelPath = './models/';
       this.model = this.model.slice('local/'.length);
     }
     this.pipe = await pipeline('automatic-speech-recognition', this.model, {
-      dtype: this.quantized,
+      dtype: whisperDtypeFor(this.device, this.quantized),
       device: this.device,
       progress_callback: (p) => {
         if (onProgress && p.status === 'progress' && p.total) {

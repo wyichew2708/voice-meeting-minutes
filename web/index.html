@@ -19,6 +19,16 @@
     <button id="start" class="primary">Start</button>
     <button id="pause" hidden>Pause</button>
     <button id="end" hidden class="danger">End</button>
+    <select id="speakerCount" class="count" title="How many people are in the room? Setting it re-clusters immediately and again at End.">
+      <option value="">Speakers: auto</option>
+      <option value="2">2 speakers</option><option value="3">3 speakers</option>
+      <option value="4">4 speakers</option><option value="5">5 speakers</option>
+      <option value="6">6 speakers</option><option value="7">7 speakers</option>
+      <option value="8">8 speakers</option><option value="9">9 speakers</option>
+      <option value="10">10 speakers</option><option value="11">11 speakers</option>
+      <option value="12">12 speakers</option><option value="14">14 speakers</option>
+      <option value="16">16 speakers</option>
+    </select>
     <button id="generate" disabled>Write minutes</button>
     <button id="openSettings" class="ghost" title="Settings">Settings</button>
   </div>
@@ -89,6 +99,11 @@
   <p class="note">Decides when someone is talking. The energy gate opens for air-con, keyboards
      and breathing; each false open is a clip the recogniser can invent words for.</p>
 
+  <label class="check"><input id="micProcessing" type="checkbox">
+    Browser audio processing — noise suppression, auto gain, echo cancellation</label>
+  <p class="note">Off by default. It is built for calls and reshapes the voice the speaker
+     model reads; turn it on for a very noisy room and expect speaker labels to suffer.</p>
+
   <div id="webspeechRow">
     <label>Language
       <select id="asrLang">
@@ -107,30 +122,20 @@
   <div id="whisperRow" hidden>
     <label>Model
       <select id="whisperModel">
-        <option value="mjwong/whisper-small-singlish">whisper-small-singlish — 0.2B, 18.5% WER, Apache-2.0</option>
-        <option value="mjwong/whisper-large-v3-turbo-singlish">whisper-large-v3-turbo-singlish — 0.8B, 13.3% WER, MIT</option>
-        <option value="local/whisper-singlish-onnx">local export (web/models/)</option>
-        <option value="onnx-community/whisper-base">whisper-base — no Singlish tuning, for comparison</option>
+        <option value="local/mjwong/whisper-small-singlish">whisper-small-singlish — local export, 0.2B, Apache-2.0</option>
+        <option value="local/mjwong/whisper-large-v3-turbo-singlish">whisper-large-v3-turbo-singlish — local export, 0.8B, MIT</option>
+        <option value="onnx-community/whisper-base">whisper-base from the Hub — no Singlish tuning, for comparison</option>
       </select>
     </label>
-    <div class="row">
-      <label>Precision
-        <select id="whisperDtype">
-          <option value="q8">q8 — smallest</option>
-          <option value="fp16">fp16</option>
-          <option value="fp32">fp32 — largest</option>
-        </select>
-      </label>
-      <label>Device
-        <select id="whisperDevice">
-          <option value="webgpu">WebGPU</option>
-          <option value="wasm">WASM — slower, works everywhere</option>
-        </select>
-      </label>
-    </div>
-    <p class="note warn">The Singlish models ship safetensors, not ONNX. Convert once with
-       <code>tools/export_singlish_onnx.py</code> and pick <em>local export</em>, or the
-       Hub entries above will fail to load.</p>
+    <label>Device
+      <select id="whisperDevice">
+        <option value="webgpu">WebGPU — q4, ~300 MB, about ten times faster than real time</option>
+        <option value="wasm">wasm — q8, ~410 MB, real time on one thread, 4× on the isolated server</option>
+      </select>
+    </label>
+    <p class="note">Precision is chosen per device from what was measured — q8 on WebGPU produces
+       garbage and is never used. Without WebGPU the app falls back to wasm on its own. The
+       export comes from <code>tools/export_singlish_onnx.py</code>.</p>
   </div>
 
   <h3>Speaker identification</h3>

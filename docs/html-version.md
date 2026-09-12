@@ -27,13 +27,24 @@ this branch's habit is to measure rather than assume, what was measured.
 
 ```
 python3 tools/fetch_models.py          # once: the 29 MB speaker model
-cd web && python3 -m http.server 8791
+python3 tools/export_singlish_onnx.py  # once, optional: the local Singlish Whisper (~1 GB download)
+python3 tools/serve.py                 # http://localhost:8791
 ```
 
-Then <http://localhost:8791>. A static server is needed — ES modules do not
-load over `file://` — and `localhost` counts as a secure context, so
-`getUserMedia` works without certificates. Without the model the app runs on
-the built-in embedder and says so; see [the limit](#the-built-in-fallback) below.
+`tools/serve.py` is `http.server` with two changes. Caching is off — browsers
+heuristically cache ES modules from a plain static server, and after pulling an
+update you can quietly be running last week's `asr.js`. And the page is served
+cross-origin isolated, which unlocks multi-threaded wasm and makes Whisper on
+wasm four times faster (below). `localhost` counts as a secure context, so
+`getUserMedia` works without certificates. Without the
+speaker model the app runs on the built-in embedder and says so; see
+[the limit](#the-built-in-fallback) below.
+
+**Start with <http://localhost:8791/selftest.html>.** It proves the pipeline in
+your browser matches the reference without a microphone, records you for 14 s
+and reports what your microphone and room look like to the speaker model — the
+thing no test corpus can tell you — and scores the Singlish export on real
+Singlish.
 
 ## Speech recognition
 
@@ -42,6 +53,17 @@ Two engines, and the choice is a privacy decision before it is a quality one.
 **Browser recognition** starts instantly and downloads nothing. In Chrome it is
 *not local*: microphone audio goes to Google's servers. For a meeting under NDA
 that is the wrong default.
+
+It also runs on its own clock. Results arrive about a second after speech ends,
+and the first build attached each one to *the latest segment without text* —
+which by then was often the next speaker's. Text landing on the wrong person
+reads exactly like bad diarization, and it was not the embedder at all. Each
+result now carries when it was first heard and when it was finalised, and goes
+to the segment it overlaps most, after subtracting the recogniser's lags
+(~0.6 s at the start, ~0.8 s at the end). It is still approximate — a result
+spanning two speakers lands on whichever it overlaps more — which is the
+strongest reason to prefer Whisper, which transcribes exactly the clip cut for
+each speaker.
 
 **Whisper-Singlish** is fully local once cached. Vanilla Whisper is not an
 option — on SASRBench-v1, spontaneous Singlish:
@@ -56,12 +78,50 @@ option — on SASRBench-v1, spontaneous Singlish:
 Above 100% WER means the model inserts more words than the reference contains.
 The finetune is the difference between working and not.
 
-None of them publish ONNX weights, and transformers.js needs ONNX. Convert once:
+None of them publish ONNX weights, and transformers.js needs ONNX.
+[`tools/export_singlish_onnx.py`](../tools/export_singlish_onnx.py) drives the
+official transformers.js conversion script in an isolated venv. It took three
+attempts to find the two pins that matter — torch 2.5.1, because newer torch's
+dynamo exporter writes a file name optimum does not expect, and `onnxscript` —
+and they are in the script. It exports two pairs: q4 (encoder 66 MB + merged
+decoder 233 MB) for WebGPU and q8 (92 + 315 MB) for wasm, loaded from
+`web/models/` as `local/mjwong/whisper-small-singlish` and cached by the browser
+after the first run. One more thing the self-test
+caught before a user did: transformers.js disallows *local* models in browsers
+by default, and a loader that only turns remote off has turned everything off.
 
-```
-pip install "optimum[onnxruntime]" onnx
-python3 tools/export_singlish_onnx.py
-```
+**Measured on real Singlish.** Thirty clips of spontaneous conversation from
+[SASRBench-v1](https://huggingface.co/datasets/mjwong/SASRBench-v1) — 7.5
+minutes, 1,350 words, fetched row by row from the Hugging Face datasets-server
+rather than the 1.6 GB shards — through the fp32 model in PyTorch
+([`sim/singlish_wer_reference.py`](../sim/singlish_wer_reference.py)):
+**18.5% WER**, against the model card's 18.49% on the full benchmark. The
+particles survive — *"so cheem"*, *"wah"*, *"ya"* — rather than being fought.
+**And through the browser.** The self-test page runs the same thirty clips
+through the local export — on wasm, and on WebGPU at the precision the app
+actually loads. Measured on this machine (Apple silicon, Chrome):
+
+| Backend | Precision | Correct | Speed | Download |
+|---|---|---|---|---|
+| wasm, one thread | q8 | **19.1% WER** | 0.84× real time | 407 MB |
+| wasm, four threads — isolated page | q8 | 19.1% WER | **0.24× real time** | 407 MB |
+| WebGPU | q8 | **garbage** — `!!!!!!` | 3.2× real time | — |
+| WebGPU | fp32 | text identical to PyTorch | 0.08–0.10× real time | 968 MB |
+| WebGPU | **q4 encoder + q4 decoder** | **18.6% WER** | **0.09× real time** | **299 MB** |
+
+Three things follow, and all three are in the code. Precision is chosen per
+backend (`whisperDtypeFor` in `asr.js`), and q8 is never loaded on WebGPU —
+that combination is not slow, it is *wrong*, and it looked fine until the words
+came out. WebGPU with q4 is the default: ten times faster than live, a 300 MB
+download, and a fallback to wasm when the browser has no WebGPU. And
+`tools/serve.py` serves the page cross-origin isolated by default, because that
+is what lets onnxruntime use four threads and turns wasm from "just behind
+live" into four times ahead of it; the CDNs used here send the
+`Cross-Origin-Resource-Policy` header isolation requires, and the minutes call
+is an ordinary CORS fetch. q4 on WebGPU lands at 18.6% against the fp32
+reference's 18.5% — quantisation's price is a word in a thousand; q8 on wasm
+pays 19.1%. The hallucination filter flagged none of the thirty clips on either
+backend.
 
 ### Getting more out of Whisper
 
@@ -115,6 +175,34 @@ so a room with a noise floor still trims to the speech.
 [`sim/verify_trim.mjs`](../sim/verify_trim.mjs) covers digital silence, room
 hiss at two levels, a backchannel, and a quiet speaker at −20 dB — which failed
 at first, because the absolute floor was set for a close mic; it is now −56 dBFS.
+
+**Browser audio processing is off by default.** Noise suppression, auto gain
+and echo cancellation are built for calls: the first reshapes the spectrum a
+speaker model reads, the second hides the level differences between people, and
+there is no far end here for the third to cancel. A setting turns them back on
+for a very noisy room, with a note about what it costs.
+
+### One window, not two
+
+[`sim/windowed.py`](../sim/windowed.py) embedded on a rolling 4 s window ending
+at the cut, so one speaker chopped into 2 s pieces still gave the embedder
+enough voice — and the first browser build did the same. Measured with CAM++ on
+real speech in meeting-shaped conversations
+([`sim/window_vs_segment.py`](../sim/window_vs_segment.py)), the window is a
+net loss: it reaches back into the *previous* speaker's turn, and **61–75% of
+short replies then embed nearer to whoever spoke before**.
+
+| People | Segment only | Rolling window |
+|---|---|---|
+| 4 | 4.0 clusters, 0.0% | 4.6 clusters, 2.6% |
+| 8 | 7.8 clusters, 0.1% | 8.8 clusters, 2.2% |
+| 10 | 8.8 clusters, 8.2% | 10.6 clusters, 9.9% |
+
+The embedder now gets the turn and nothing else. The case the window protected
+against is covered another way: Silero's hangover does not cut a turn at a
+breath, and the clusterer's guards keep segments under 1.5 s out of the
+centroids and defer them to the end. A scale-test decision reversed by a
+measurement is this branch working as intended.
 
 ## Speaker identification
 
@@ -209,6 +297,35 @@ The browser check itself is simple and worth repeating after any change to
 and compare against `campp_ref.json` written by `sim/campp_reference.py`. All
 three should be above 0.999.
 
+### When the room is not the corpus
+
+Everything above is twelve close-talk synthetic voices. A real table mic shifts
+the geometry, and the thresholds are a guess about a room the model has never
+heard. Three things put the user in charge of that instead of the numbers.
+
+**A known headcount.** The header has a *Speakers* control. Set it, and the
+banked embeddings are re-clustered to exactly that many — the closest pair
+merged while there are too many, the least coherent cluster split in two while
+there are too few, then every segment given its nearest centroid — instantly,
+mid-meeting or at End. On the synthetic geometry it repairs both directions: an
+over-split of 128 clusters and an under-split of 5 both come back to exactly 10
+at 0% confusion ([`sim/verify_js_port.mjs`](../sim/verify_js_port.mjs)). A
+headcount is a fact; a threshold is not.
+
+**Labels that follow the evidence.** Re-clustering and deferral rewrite
+assignments after the fact, and the transcript used to follow them only at End
+— so an early over-split sat on screen looking wrong until the meeting was
+over, and a deferred segment showed as *Speaker 0*. Labels now track the
+clusterer live, and a deferred segment shows its nearest centroid with a dashed
+outline until it is settled.
+
+**Your microphone, measured.** The self-test's second check records 14 s of
+you, reports what the browser actually applied to the track, and prints the
+cosine between your own segments — one voice should read above the 0.65
+speaker-change threshold. If it does not, the room is splitting one person into
+several, and the fixes are physical before they are numerical: closer to the
+mic, processing off, a quieter room.
+
 ### The built-in fallback
 
 The app still runs with nothing downloaded, on long-term MFCC statistics. It is
@@ -255,13 +372,15 @@ narrows where to look; it does not make the model honest.
 
 | Check | What it proves |
 |---|---|
-| `node sim/verify_js_port.mjs` | The JS clusterer reproduces the Python scale-test claims |
+| `node sim/verify_js_port.mjs` | The JS clusterer reproduces the Python scale-test claims; a known headcount repairs over- and under-splits |
 | `node sim/verify_fbank.mjs` | `fbank.js` is Kaldi fbank, frame for frame |
 | `node sim/verify_trim.mjs` | Windows end at the last word, not at the gate's hangover |
 | `node sim/verify_hallucination_filter.mjs` | Whisper subtitles dropped, backchannels kept |
 | `node sim/verify_grounding.mjs` | Minutes items flagged for the right reasons |
 | `python3 sim/campp_reference.py` | CAM++ geometry, CMN, the threshold scan, the near-clone pair; writes the browser reference |
-| In-browser: embed `web/models/_test/*.wav`, compare to `campp_ref.json` | The browser pipeline equals the Python one |
+| `python3 sim/window_vs_segment.py` | The rolling embedding window against the turn alone, on real embeddings |
+| `python3 sim/singlish_wer_reference.py` | Singlish WER through fp32 PyTorch on 30 SASRBench-v1 clips — 18.5% — the number the browser export should reproduce |
+| `web/selftest.html` | In your browser: the live pipeline against the reference without a microphone; your microphone and room; the Singlish export's WER |
 
 `sim/make_tts_corpus.sh` needs macOS (`say`). The corpus is not committed; it
 regenerates in under a minute.

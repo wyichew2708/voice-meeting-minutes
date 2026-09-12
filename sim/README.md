@@ -62,6 +62,8 @@ Mac. Full write-up in [`../docs/html-version.md`](../docs/html-version.md).
 | `verify_grounding.mjs` | Minutes items flagged against the transcript for the right reasons |
 | `make_tts_corpus.sh` | Twelve TTS voices, eight utterances each — real speech for the speaker model (macOS `say`) |
 | `campp_reference.py` | CAM++ through the reference pipeline: geometry, CMN, the threshold scan, who merges with whom; writes the browser check's reference |
+| `window_vs_segment.py` | The rolling embedding window against the turn alone, on real embeddings — the window lost, and `web/js/audio.js` changed |
+| `singlish_wer_reference.py` | Singlish WER for the Whisper finetune on 30 SASRBench-v1 clips through fp32 PyTorch: 18.5%, the model card's 18.49% |
 
 ⚠ The TTS corpus is real speech through a real speaker model, which the
 synthetic geometry above is not — and it is still twelve close-talk synthetic

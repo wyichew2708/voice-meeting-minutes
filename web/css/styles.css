@@ -52,6 +52,8 @@ button:disabled { opacity: .45; cursor: default; }
 button.primary { background: var(--accent); border-color: var(--accent); color: #fff; }
 button.danger { color: var(--bad); border-color: color-mix(in srgb, var(--bad) 40%, var(--line)); }
 button.ghost { background: transparent; color: var(--muted); }
+select.count { font: inherit; font-size: 13px; padding: 7px 10px; border-radius: 8px;
+               border: 1px solid var(--line); background: var(--panel); color: var(--ink); }
 
 .meter { height: 3px; background: var(--line); }
 #meterFill { height: 100%; width: 0; background: var(--muted); transition: width .06s linear; }
@@ -96,6 +98,9 @@ main { display: grid; grid-template-columns: 1fr; gap: 18px; padding: 18px 20px 
 .text { white-space: pre-wrap; word-break: break-word; }
 .line.pending .text { color: var(--muted); letter-spacing: .15em; }
 .line.pending .who { opacity: .55; }
+.who.provisional { opacity: .7; outline: 1px dashed rgba(255,255,255,.7); outline-offset: -1px; }
+label.check { display: flex; align-items: center; gap: 8px; }
+label.check input { width: auto; margin: 0; }
 
 .interim { padding: 4px 14px 12px 71px; color: var(--muted); font-style: italic;
            min-height: 0; opacity: 0; transition: opacity .15s; }
