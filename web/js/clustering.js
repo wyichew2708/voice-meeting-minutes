@@ -71,6 +71,13 @@ export const SPECTRAL_FALLBACK = {
  *     threshold 0.60 -> 0.65   10 people: 8.9 -> 9.5 clusters, 10.4% -> 5.8%
  *     recluster 0.72 -> 0.80   the 0.72 pass was merging the closest pair
  *
+ * Then real speech moved the recluster pass once more, 0.80 -> 0.75. On a
+ * four-host podcast (sim/backtest_youtube.py) one person's voice drifted into
+ * two labels whose centroids sat at cosine 0.79 — missed by the 0.80 pass by a
+ * hundredth — while two different hosts on a second podcast sat at 0.37 and
+ * the TTS sound-alike pair at 0.723. 0.75 heals the drift and still keeps
+ * those apart. One real video drove it; the other two sources confirm no harm.
+ *
  * The confusion that remains is ONE pair, in six seeds of eight: two Indian-
  * English male voices at centroid cosine 0.723. No threshold under 0.72 separates
  * them and anything over it splits the same person (within p05 0.43). With
@@ -87,8 +94,13 @@ export const SPEAKER_MODEL = {
   margin: 0.06,
   deferUnderSeconds: 1.5,
   reclusterEvery: 100,
-  reclusterThreshold: 0.80,
+  reclusterThreshold: 0.75,
 };
+
+/** A label with less speech than this is a blip — a laugh, a cough, a music
+ *  sting, a "ya" — not a person holding a seat. The design's auto-prompt uses a
+ *  similar bar (§4.4: ≥ 6 s before asking who someone is). */
+export const MIN_SPEAKER_SECONDS = 5.0;
 
 /** Speakers above which the built-in embedder should not be trusted. */
 export const SPECTRAL_RELIABLE_SPEAKERS = 4;
@@ -267,8 +279,18 @@ export class OnlineClusterer {
   reclusterTo(n) {
     if (!n || n < 1 || !this.clusters.length) return 0;
     const before = new Map(this.assignment);
+    // What the headcount made us do. A merge of two voices that both spoke at
+    // length and were not alike is the signature of a headcount that is too
+    // low — on a real podcast, "told 4" merged two different people because
+    // the room had five. The app shows it rather than hiding it.
+    this.lastRecluster = { forcedMerges: [] };
     this.resolveDeferred();
-    while (this.clusters.length > n && this._mergeClosest()) { /* merge */ }
+    // Blips go first. On a real podcast the closest pair of clusters was the
+    // two hosts, and merging them while a 3 s laugh kept its own label gave
+    // "one speaker" for a dialogue. A label that has not spoken for
+    // MIN_SPEAKER_SECONDS is absorbed into its nearest neighbour before any
+    // two real speakers are considered for merging.
+    while (this.clusters.length > n && (this._absorbTiniest() || this._mergeClosest())) { /* reduce */ }
     while (this.clusters.length < n && this._splitWidest()) { /* split */ }
     const all = this.clusters.flatMap(c => c.bank);
     for (const c of this.clusters) { c.bank = []; c.n = 0; c.seconds = 0; }
@@ -284,7 +306,29 @@ export class OnlineClusterer {
     for (const c of this.clusters) this._recentre(c);
     let changed = 0;
     for (const [k, v] of this.assignment) if (before.get(k) !== v) changed++;
+    this.lastRecluster.changed = changed;
+    this.lastRecluster.suspicious = this.lastRecluster.forcedMerges
+      .filter(m => m.cosine < this.cfg.threshold && m.secondsA >= 30 && m.secondsB >= 30);
     return changed;
+  }
+
+  _absorbTiniest() {
+    const tiny = this.clusters.filter(c => c.seconds < MIN_SPEAKER_SECONDS);
+    if (!tiny.length || this.clusters.length < 2) return false;
+    const drop = tiny.reduce((a, b) => (a.seconds <= b.seconds ? a : b));
+    let keep = null, best = -Infinity;
+    for (const c of this.clusters) {
+      if (c === drop) continue;
+      const s = dot(c.centroid, drop.centroid);
+      if (s > best) { best = s; keep = c; }
+    }
+    keep.bank.push(...drop.bank);
+    keep.seconds += drop.seconds;
+    keep.n += drop.n;
+    this._recentre(keep);
+    for (const [k, v] of this.assignment) if (v === drop.id) this.assignment.set(k, keep.id);
+    this.clusters.splice(this.clusters.indexOf(drop), 1);
+    return true;
   }
 
   _mergeClosest() {
@@ -298,6 +342,7 @@ export class OnlineClusterer {
     if (!pair) return false;
     const a = this.clusters[pair[0]], b = this.clusters[pair[1]];
     const [keep, drop] = a.seconds >= b.seconds ? [a, b] : [b, a];
+    this.lastRecluster?.forcedMerges.push({ secondsA: keep.seconds, secondsB: drop.seconds, cosine: best });
     keep.bank.push(...drop.bank);
     keep.seconds += drop.seconds;
     keep.n += drop.n;
@@ -333,6 +378,10 @@ export class OnlineClusterer {
       if (!A.length || !B.length) return false;
       ca = this._meanOf(A); cb = this._meanOf(B);
     }
+    // A split that leaves one side with less than a real speaker's worth of
+    // speech has found a blip, not a person.
+    const secs = (g) => g.reduce((s, x) => s + x.seconds, 0);
+    if (secs(A) < MIN_SPEAKER_SECONDS || secs(B) < MIN_SPEAKER_SECONDS) return false;
     const mk = (bank, centroid) => ({ id: this._next++, centroid, bank, n: bank.length,
                                       seconds: bank.reduce((s, x) => s + x.seconds, 0) });
     const a = mk(A, ca), b = mk(B, cb);

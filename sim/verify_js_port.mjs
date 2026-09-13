@@ -195,6 +195,33 @@ console.log('\nknown headcount: reclusterTo(n) repairs both directions');
   check('exact 12 -> told 12 stays exact', m(exact, r => r.clusters) === 12 && m(exact, r => r.fixed.confusion) < 0.02,
         `${m(exact, r => r.clusters)} clusters, ${(m(exact, r => r.fixed.confusion) * 100).toFixed(1)}% confusion`);
   check('10 people -> told 6 gives 6', m(fewer, r => r.clusters) === 6, `${m(fewer, r => r.clusters)} clusters`);
+
+  // Five 1.6 s blips with random embeddings — laughs, stings — each opens a
+  // junk cluster. Told 10, the ten people must keep their seats: the blips are
+  // absorbed, not two real speakers merged to make room for a laugh.
+  const blips = SEEDS.map(seed => {
+    const room = new Room(10, seed), segs = turns(10, 45, seed), rng = makeRng(seed + 77);
+    const cl = new OnlineClusterer(SHIPPING);
+    for (const s of segs) cl.add(s.index, room.embed(s.speaker, s.seconds), s.seconds);
+    for (let b = 0; b < 5; b++) cl.add(10000 + b, rng.unit(), 1.6);
+    cl.finish();
+    const before = cl.clusters.length;
+    cl.reclusterTo(10);
+    return { before, after: cl.clusters.length, ...score(segs, cl.assignment) };
+  });
+  // Told one fewer than the truth, the re-cluster must merge two real people —
+  // and say so: both spoke at length and were not alike.
+  const flagged = SEEDS.map(seed => {
+    const room = new Room(4, seed), segs = turns(4, 45, seed);
+    const cl = new OnlineClusterer(SHIPPING);
+    for (const s of segs) cl.add(s.index, room.embed(s.speaker, s.seconds), s.seconds);
+    cl.finish(); cl.reclusterTo(3);
+    return cl.lastRecluster.suspicious.length;
+  });
+  check('4 people told 3 -> the forced merge is flagged', flagged.every(n => n >= 1), `${flagged.join(',')} suspicious merges flagged`);
+  check('10 people + 5 noise blips -> told 10 keeps all 10 people',
+        m(blips, r => r.after) === 10 && m(blips, r => r.speakersFound) === 10 && m(blips, r => r.confusion) < 0.02,
+        `${m(blips, r => r.before).toFixed(1)} clusters before -> ${m(blips, r => r.after)}, ${m(blips, r => r.speakersFound)} people found, ${(m(blips, r => r.confusion) * 100).toFixed(1)}% confusion`);
 }
 
 console.log(failures ? `\n${failures} check(s) failed` : '\nall checks passed');

@@ -253,7 +253,8 @@ With CMN the gap is *wider* than the ECAPA geometry the scale test assumed.
 (0.60, recluster at 0.72) is exact through 4 people on CAM++, within 1.5% at 8,
 and under-splits at 10–12. A scan over the real embeddings gave `SPEAKER_MODEL`: threshold
 **0.65**, recluster **0.80** — the 0.72 recluster pass turned out to be the
-thing merging the closest pair. With it, over 8 seeds:
+thing merging the closest pair (real speech later moved the recluster pass to
+0.75; see [the back-test](#back-testing-on-youtube)). With it, over 8 seeds:
 
 | Room | true | clusters | confusion | found |
 |---|---|---|---|---|
@@ -338,6 +339,116 @@ over-splitting side because a merge the user undoes beats misattributed lines
 they have to find). **At ten speakers it still returns ~27% confusion.** The
 app warns on screen past four voices. It is a way to try the UI, not a way to
 run a meeting.
+
+## Back-testing on YouTube
+
+There is no test corpus for "ten Singaporeans around a table", but there are
+thousands of hours of Singaporeans talking on YouTube.
+[`sim/backtest_youtube.py`](../sim/backtest_youtube.py) fetches the audio of a
+video (yt-dlp, converted with macOS `afconvert` — no ffmpeg), takes a ten-minute
+excerpt, and runs the app's pipeline over it component for component: Silero
+VAD with the app's thresholds, the trailing-silence trim, CAM++ on the turn
+alone, `sim/clustering.py` with `SPEAKER_MODEL` (the JS is its verified port),
+the known-headcount re-cluster, same-speaker coalescing, the hallucination
+filter and the Singlish Whisper. The audio stays in `sim/backtest/`, which is
+gitignored — on this machine, for testing, and nowhere else.
+
+What it is scored against matters more than the score, and the first two
+videos rearranged that list. In order of trust:
+
+1. **The transcript, labelled.** One label saying two people's lines, or a
+   question and its answer under one label, is obvious to a reader in seconds.
+   Where the headcount re-cluster changed a label, the live auto label is shown
+   beside it.
+2. **The headcount you know.** Speakers found — labels with at least 5 s of
+   speech — against speakers present, and how the speaking time splits.
+3. **A manual RTTM** for a few minutes (`--rttm`), which makes DER real.
+4. **A second diarizer, opt-in** (`--reference`): pyannote segmentation 3.0
+   via sherpa-onnx (no Hugging Face gating, which was §12.2) with the same CAM++
+   embeddings. It was going to be reference number one. On the toy signal it
+   found four voices in three; on the first real video, told two, it put 591 s
+   on one speaker and 7 s on the other for a *dialogue*; told nothing on a
+   four-host show it found eleven. Worse than the app on every count, so a DER
+   against it says more about it than about the app.
+
+Transcripts are scored against creator-uploaded captions only when they exist
+— auto-captions are worse than the model under test.
+
+```
+python3 sim/backtest_youtube.py URL --speakers 2            # one video, ten minutes from 10:00
+python3 sim/backtest_youtube.py --manifest sim/backtests.json
+python3 sim/backtest_calibrate.py URL --speakers 2          # geometry and a threshold sweep, on validated labels
+```
+
+### What the first two videos showed
+
+| Video, excerpt 10:00–20:00 | Told | Auto found | Told found | Speaking time |
+|---|---|---|---|---|
+| *Yah Lah But* #863 — two fixed hosts | 2 | **2** (+2 blips) | 2 | 313 s / 261 s |
+| *The Daily Ketchup* EP556 — four in the room | 4 | 6 (7 before the recluster change) | 4 | 349 / 160 / 38 / 35 s |
+
+**Yah Lah But: auto was right.** Read against the transcript the two labels
+follow the dialogue at every turn — at 02:07 one asks *"was it the same feeling
+you had on Tuesday?"* and at 02:25 the other answers *"ya… I think both of us
+watched the ministerial statements"*. With those labels as truth,
+[`sim/backtest_calibrate.py`](../sim/backtest_calibrate.py) measured the
+geometry the app actually sees on real speech:
+
+| | within-speaker | between-speaker | short clips vs own speaker |
+|---|---|---|---|
+| Yah Lah But, real speech | **0.800** (p05 0.680) | **0.279** (p95 0.538, max 0.786) | 0.495 |
+| TTS corpus | 0.744 (p05 0.434) | 0.166 (p95 0.401) | 0.589 |
+
+A real person is *more* self-consistent than the TTS corpus assumed, two
+Singaporean men are more alike than random TTS voices, and the gap between the
+two is still wide. Every threshold from 0.60 to 0.70 finds exactly two;
+`SPEAKER_MODEL` transferred to real speech unchanged. The two extra labels were
+backchannels — *"ya I mean"*, 1.6–1.8 s — just over the 1.5 s deferral bar.
+
+**The Daily Ketchup: four in the room, and the numbers corrected my reading.**
+Auto found seven labels of 5 s or more; told 4, it settled to 349 / 160 / 38 /
+35 s. Reading the transcript I called the 71 s and 66 s labels two people — a
+sceptic (*"right then sack them"*) and an analyst (*"the whole parachuting
+thing"*) — and would have said the room had five. The report's
+*who-sounds-like-whom* table said otherwise: those two labels sit at cosine
+**0.79**, right at the within-speaker mean of real speech, and the three 12 s
+labels at 0.72–0.75 with each other. One person whose voice drifted, split in
+two; one quiet person, split in three; four people, as the manifest said. The
+table is printed for every run because a reader cannot hear cosine, and it is
+the number that decides whether an over-split is a second person or the same
+one on a different sentence. Four people in one studio, talking over each
+other and laughing, is the case the headcount control exists for, and the case
+the design's offline refine pass (§4.2) is the real answer to.
+
+**A threshold it moved.** The online recluster pass merged labels at ≥ 0.80,
+and that drifted pair sat at 0.79 — missed by a hundredth. It now merges at
+**0.75**: auto on the Daily Ketchup drops from seven labels to six, Yah Lah
+But's two hosts (0.37) and the TTS sound-alike pair (0.723) stay apart, and the
+TTS reference run is unchanged within seed noise. One real video drove the
+change; the other two sources confirm it costs nothing.
+
+**A wrong headcount is reported, not hidden.** Told fewer speakers than there
+are, the re-cluster has to merge two real people. It now records every merge it
+was forced into, and the app warns when a merge joined two voices that each
+spoke for 30 s or more and were not alike — *told 4, but the audio sounds like
+5* — rather than silently producing a tidy wrong answer. On the synthetic
+geometry, four people told three trips it every time; on the Daily Ketchup told
+four it stayed silent, correctly, because the merge it made was a same-person
+merge at 0.79.
+
+**The transcripts read well.** On both podcasts Whisper-Singlish produced
+readable speaker-labelled text from studio audio — *"holy mum, you look at it"*,
+*"the benchmarking to the thousand top salaried earners"* — with zero to two
+hallucinations dropped per ten minutes.
+
+**A bug the back-test found.** The headcount re-cluster reduced the count by
+merging the *closest pair*. On Yah Lah But the closest pair was the two hosts,
+so it merged them and kept a 3 s laugh as the second speaker — one label for a
+dialogue. Blips are now absorbed into their nearest neighbour before any two
+real speakers are considered, in both the JS and the Python;
+[`sim/verify_js_port.mjs`](../sim/verify_js_port.mjs) and
+[`sim/verify_headcount.py`](../sim/verify_headcount.py) plant five noise blips
+into a ten-person meeting and require all ten people to keep their seats.
 
 ## Minutes
 

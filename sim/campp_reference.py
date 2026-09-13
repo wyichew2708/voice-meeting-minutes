@@ -42,7 +42,7 @@ SHIPPING = Config(threshold=0.60, min_centroid_seconds=1.5, margin=0.06,
                   defer_under_seconds=1.5, recluster_every=100, recluster_threshold=0.72)
 # web/js/clustering.js SPEAKER_MODEL — what this script measured for CAM++
 SPEAKER_MODEL = Config(threshold=0.65, min_centroid_seconds=1.5, margin=0.06,
-                       defer_under_seconds=1.5, recluster_every=100, recluster_threshold=0.80)
+                       defer_under_seconds=1.5, recluster_every=100, recluster_threshold=0.75)
 # the three files the in-browser check embeds
 BROWSER_TEST = [('samantha3.wav', 'Samantha', 3), ('daniel5.wav', 'Daniel', 5), ('rishi7.wav', 'Rishi', 7)]
 
@@ -148,7 +148,7 @@ def main() -> int:
         print(f'\n{name}')
         for k in (2, 4, 8, 10, 12):
             report(E[False], f'{k} people', VOICES[:k], cfg)
-    for name, cfg in (('SHIPPING (0.60 / 0.72), CMN', SHIPPING), ('SPEAKER_MODEL (0.65 / 0.80), CMN', SPEAKER_MODEL)):
+    for name, cfg in (('SHIPPING (0.60 / 0.72), CMN', SHIPPING), ('SPEAKER_MODEL (0.65 / 0.75), CMN', SPEAKER_MODEL)):
         print(f'\n{name}')
         for k in (2, 4, 8, 10, 12):
             report(E[True], f'{k} people', VOICES[:k], cfg)

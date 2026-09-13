@@ -6,3 +6,6 @@ web/models/
 
 # TTS test corpus — regenerate with sim/make_tts_corpus.sh (macOS)
 sim/corpus/
+
+# YouTube back-test audio and reports — sim/backtest_youtube.py
+sim/backtest/

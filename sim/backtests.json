@@ -1,0 +1,6 @@
+[
+  {"url": "https://www.youtube.com/watch?v=z67Xup1gHBo", "speakers": 2, "start": 600, "minutes": 10,
+   "note": "Yah Lah But #863 — two fixed hosts; auto finds both, cosine 0.37 between them"},
+  {"url": "https://www.youtube.com/watch?v=wrOpdsEaE14", "speakers": 4, "start": 600, "minutes": 10,
+   "note": "The Daily Ketchup EP556 — four in the room; auto splits one drifted voice (0.79) and one quiet voice (0.72-0.75)"}
+]

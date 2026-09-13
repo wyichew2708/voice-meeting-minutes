@@ -352,7 +352,13 @@ function applySpeakerCount() {
   const changed = clusterer.reclusterTo(n);
   syncLabels();
   render();
-  setStatus(`re-clustered to ${n} speakers — ${changed} line${changed === 1 ? '' : 's'} relabelled`);
+  const sus = clusterer.lastRecluster?.suspicious ?? [];
+  if (sus.length) {
+    const m = sus[0];
+    warn(`told ${n}, but the audio sounds like ${n + sus.length}: merged two voices that spoke for ${Math.round(m.secondsA)} s and ${Math.round(m.secondsB)} s and did not sound alike (similarity ${m.cosine.toFixed(2)}). Try ${n + sus.length}.`);
+  } else {
+    setStatus(`re-clustered to ${n} speakers — ${changed} line${changed === 1 ? '' : 's'} relabelled`);
+  }
   store.saveSession(session).catch(() => {});
 }
 

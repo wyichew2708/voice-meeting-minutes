@@ -64,6 +64,11 @@ Mac. Full write-up in [`../docs/html-version.md`](../docs/html-version.md).
 | `campp_reference.py` | CAM++ through the reference pipeline: geometry, CMN, the threshold scan, who merges with whom; writes the browser check's reference |
 | `window_vs_segment.py` | The rolling embedding window against the turn alone, on real embeddings — the window lost, and `web/js/audio.js` changed |
 | `singlish_wer_reference.py` | Singlish WER for the Whisper finetune on 30 SASRBench-v1 clips through fp32 PyTorch: 18.5%, the model card's 18.49% |
+| `verify_headcount.py` | The Python port of the known-headcount re-cluster repairs over- and under-splits, like the JS |
+| `speaker_embed.py` | CAM++ the reference way — torchaudio Kaldi fbank, mean subtraction, onnxruntime — and the trailing-silence trim, shared by the scripts below |
+| `backtest_youtube.py` | The app's pipeline over an excerpt of a YouTube video: speakers found against the known headcount, a labelled transcript to read, optionally a manual RTTM or a second diarizer; audio stays local |
+| `backtest_calibrate.py` | The embedding geometry the app sees on a real video and a threshold sweep, against labels you have validated |
+| `verify_backtest_parts.py` | The back-test's DER scoring on hand-built cases, and the Python hallucination filter against the JS test's twenty |
 
 ⚠ The TTS corpus is real speech through a real speaker model, which the
 synthetic geometry above is not — and it is still twelve close-talk synthetic
